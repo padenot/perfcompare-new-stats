@@ -1,0 +1,6 @@
+scipy
+retry
+KDEpy
+cliffs_delta
+pymannkendall
+ipywidgets
