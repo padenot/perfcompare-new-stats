@@ -8,11 +8,14 @@ import sys
 import json
 import argparse
 import numpy as np
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 import warnings
 from datetime import datetime
+import hashlib
+import os
+from pathlib import Path
 
 import requests
 from retry import retry
@@ -50,6 +53,7 @@ except ImportError:
 
 
 PVALUE_THRESHOLD = 0.05
+CACHE_DIR = Path.home() / ".cache" / "perf_compare_cli"
 
 @retry(tries=3)
 def get_data(url):
@@ -64,6 +68,67 @@ def get_data(url):
         raise Exception(
             f"Failed to fetch data. HTTP Status Code: {response.status_code}"
         )
+
+
+def get_cache_key(url):
+    """Generate cache key from URL."""
+    return hashlib.md5(url.encode()).hexdigest()
+
+
+def load_cached_data(url):
+    """Load cached data if available."""
+    cache_key = get_cache_key(url)
+    cache_file = CACHE_DIR / f"{cache_key}.json"
+
+    if cache_file.exists():
+        print(f"Loading cached data from {cache_file}")
+        with open(cache_file, "r") as f:
+            return json.load(f)
+    return None
+
+
+def save_to_cache(url, data):
+    """Save data to cache."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_key = get_cache_key(url)
+    cache_file = CACHE_DIR / f"{cache_key}.json"
+
+    with open(cache_file, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"Data cached to {cache_file}")
+
+
+def fuzzy_match(text, search_terms):
+    """Simple fuzzy matching using substring search."""
+    if not search_terms:
+        return True
+
+    # Normalize text and search terms - replace underscores with spaces
+    text_lower = text.lower().replace('_', ' ')
+    search_lower = search_terms.lower().replace('_', ' ')
+
+    # Split search terms by space and check if all terms are present
+    terms = search_lower.split()
+    return all(term in text_lower for term in terms)
+
+
+def filter_results_by_search(data, search_term):
+    """Filter results based on search term using fuzzy matching."""
+    if not search_term:
+        return data
+
+    print(f"Filtering results for search term: '{search_term}'")
+
+    filtered_data = []
+    for item in data:
+        # Combine suite, test, and platform for searching
+        searchable_text = f"{item.get('suite', '')} {item.get('test', '')} {item.get('platform', '')} {item.get('header_name', '')}"
+
+        if fuzzy_match(searchable_text, search_term):
+            filtered_data.append(item)
+
+    print(f"Found {len(filtered_data)} matching results out of {len(data)} total")
+    return filtered_data
 
 
 def summarize_data(series):
@@ -301,6 +366,7 @@ def parse_perf_compare_url(url):
         new_repo = params.get("newRepo", [""])[0]
         new_rev = params.get("newRev", [""])[0]
         framework = params.get("framework", [""])[0]
+        search_term = params.get("search", [""])[0]
 
         if not all([base_repo, base_rev, new_repo, new_rev, framework]):
             raise ValueError("Missing required parameters in URL")
@@ -312,28 +378,55 @@ def parse_perf_compare_url(url):
             f"&new_repository={new_repo}"
             f"&new_revision={new_rev}"
             f"&framework={framework}"
+            f"&no_subtests=true"
         )
 
-        return api_url
+        # Decode search term if present (handles URL encoding like + for space)
+        if search_term:
+            search_term = unquote(search_term.replace('+', ' '))
+
+        return api_url, search_term
     else:
-        # Assume it's already an API URL
-        return url
+        # Assume it's already an API URL, extract search from it if present
+        params = parse_qs(parsed.query)
+        search_term = params.get("search", [""])[0]
+        if search_term:
+            search_term = unquote(search_term.replace('+', ' '))
+        return url, search_term
 
 
-def fetch_performance_data(url, use_replicates=True):
-    """Fetch performance data from the API."""
-    # Ensure replicates parameter is in the URL
-    if "replicates=" not in url:
+def fetch_performance_data(url, use_replicates=True, use_cache=True):
+    """Fetch performance data from the API with caching support."""
+    # Note: The API seems to not support replicates=true properly
+    # When use_replicates is True, we'll omit the parameter entirely
+    # When False, we'll add replicates=false
+
+    # Remove any existing replicates parameter
+    if "replicates=" in url:
+        import re
+        url = re.sub(r'[&?]replicates=[^&]*', '', url)
+        # Fix the query string if needed
+        if '?' not in url and '&' in url:
+            url = url.replace('&', '?', 1)
+
+    # Only add replicates=false when explicitly requested
+    if not use_replicates:
         separator = "&" if "?" in url else "?"
-        url = f"{url}{separator}replicates={'true' if use_replicates else 'false'}"
-    elif not use_replicates:
-        # Replace replicates=true with replicates=false
-        url = url.replace("replicates=true", "replicates=false")
+        url = f"{url}{separator}replicates=false"
+
+    # Try to load from cache first
+    if use_cache:
+        cached_data = load_cached_data(url)
+        if cached_data is not None:
+            return cached_data
 
     print(f"Fetching data from: {url}")
 
     try:
         data = get_data(url)
+        # Save to cache for future use
+        if use_cache:
+            save_to_cache(url, data)
         return data
     except Exception as e:
         print(f"Error fetching data: {e}", file=sys.stderr)
@@ -343,13 +436,18 @@ def fetch_performance_data(url, use_replicates=True):
 def prepare_data_for_pipeline(item, use_replicates):
     """Prepare data from API response for analysis."""
     if use_replicates:
-        # Use replicates data - flatten the list of values
-        base_data = item.get("base_runs_replicates", [])
-        new_data = item.get("new_runs_replicates", [])
+        # Try to use replicates data first
+        base_replicates = item.get("base_runs_replicates", [])
+        new_replicates = item.get("new_runs_replicates", [])
 
-        # Convert to numpy array and ensure it's flattened
-        base_data = np.array(base_data).flatten() if base_data else np.array([])
-        new_data = np.array(new_data).flatten() if new_data else np.array([])
+        # Use replicates if BOTH are available
+        if base_replicates and new_replicates:
+            base_data = np.array(base_replicates).flatten()
+            new_data = np.array(new_replicates).flatten()
+        else:
+            # Fall back to regular runs if either replicate is missing
+            base_data = np.array(item.get("base_runs", []))
+            new_data = np.array(item.get("new_runs", []))
     else:
         # Use aggregated runs data
         base_data = np.array(item.get("base_runs", []))
@@ -518,6 +616,10 @@ def process_single_test(args):
     if len(base_data) == 0 and len(new_data) == 0:
         return None
 
+    # Skip if missing either base or new data (can't compare)
+    if len(base_data) == 0 or len(new_data) == 0:
+        return None
+
     # Reshape for pipeline (expects 3D: tasks x iterations x runs)
     base_data_3d = (
         base_data.reshape(1, 1, -1) if len(base_data) > 0 else np.array([[[]]])
@@ -550,7 +652,7 @@ def process_single_test(args):
 
     except Exception as e:
         print(f"\nError running pipeline for {suite} - {test}: {e}", file=sys.stderr)
-        statistical_analysis = "Statistical analysis failed"
+        statistical_analysis = f"Statistical analysis failed: {str(e)}"
 
     # Analyze performance change (our pipeline only)
     perf_analysis = analyze_performance_change(item, base_data, new_data)
@@ -599,19 +701,24 @@ def process_results(data, use_replicates, limit=None, workers=None):
     """Process the fetched performance data through parallel processing."""
     results = []
 
-    # Filter to only items with data
-    items_with_data = [
-        item
-        for item in data
-        if (
-            use_replicates
-            and (item.get("base_runs_replicates") or item.get("new_runs_replicates"))
-        )
-        or (not use_replicates and (item.get("base_runs") or item.get("new_runs")))
-    ]
+    # Filter to only items with data - require BOTH base and new for comparison
+    # When use_replicates is True, we'll fall back to regular runs if replicates aren't available
+    items_with_data = []
+    for item in data:
+        has_replicates = item.get("base_runs_replicates") and item.get("new_runs_replicates")
+        has_runs = item.get("base_runs") and item.get("new_runs")
+
+        if use_replicates:
+            # Try replicates first, fall back to regular runs
+            if has_replicates or has_runs:
+                items_with_data.append(item)
+        else:
+            # Only use regular runs
+            if has_runs:
+                items_with_data.append(item)
 
     if not items_with_data:
-        print("No data found to process.")
+        print("No data found to process (need both base and new runs for comparison).")
         return results
 
     if limit:
@@ -1194,6 +1301,7 @@ Examples:
   %(prog)s "https://perf.compare/compare-results?newRev=0f8c07da4319&baseRepo=try&baseRev=7bedadac3ab7&newRepo=try&framework=13"
   %(prog)s <url> --no-replicates --workers 4
   %(prog)s <url> --limit 20 --output-file interactive_report.html
+  %(prog)s <url> --search "sessionrestore many_windows"
         """,
     )
 
@@ -1225,13 +1333,44 @@ Examples:
         metavar="TITLE",
         help='Custom title for the report (default: "Performance Comparison Report")',
     )
+    parser.add_argument(
+        "--search",
+        metavar="TERM",
+        help="Search term to filter results (overrides URL search parameter)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable cache usage for fetching data",
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear the cache directory before fetching",
+    )
 
     args = parser.parse_args()
 
-    api_url = parse_perf_compare_url(args.url)
+    # Clear cache if requested
+    if args.clear_cache and CACHE_DIR.exists():
+        import shutil
+        shutil.rmtree(CACHE_DIR)
+        print(f"Cache cleared: {CACHE_DIR}")
+
+    # Parse URL and extract search term
+    api_url, url_search_term = parse_perf_compare_url(args.url)
+
+    # Use CLI search argument if provided, otherwise use URL search parameter
+    search_term = args.search if args.search else url_search_term
 
     use_replicates = not args.no_replicates
-    data = fetch_performance_data(api_url, use_replicates)
+    use_cache = not args.no_cache
+
+    data = fetch_performance_data(api_url, use_replicates, use_cache)
+
+    # Filter results based on search term
+    if search_term:
+        data = filter_results_by_search(data, search_term)
 
     if args.save_data:
         with open(args.save_data, "w") as f:
