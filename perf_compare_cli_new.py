@@ -223,7 +223,7 @@ def interpret_effect_size(effect_size):
         return "Large difference"
 
 
-def process_new(base_rev, new_rev, header):
+def process_new(base_rev, new_rev, header, lower_is_better=True):
     """Complete statistical analysis pipeline."""
     from scipy import stats
 
@@ -346,9 +346,15 @@ def process_new(base_rev, new_rev, header):
             )
             print(f"  → Interpretation: ", end="")
             if ci_low > 0:
-                print("Performance regressed (median increased)")
+                if lower_is_better:
+                    print("Performance regressed (median increased)")
+                else:
+                    print("Performance improved (median increased)")
             elif ci_high < 0:
-                print("Performance improved (median decreased)")
+                if lower_is_better:
+                    print("Performance improved (median decreased)")
+                else:
+                    print("Performance regressed (median decreased)")
             else:
                 print("No significant shift")
 
@@ -634,10 +640,9 @@ def process_single_test(args):
             # Create header for this test
             header = f"{suite} - {test} ({platform})"
 
-            # process_new is now defined above
-
+            lower_is_better = item.get("lower_is_better", True)
             # Run full pipeline processing to get statistical analysis
-            process_new(base_data_3d, new_data_3d, header)
+            process_new(base_data_3d, new_data_3d, header, lower_is_better)
 
         # Parse and clean output
         output_text = output_buffer.getvalue()
