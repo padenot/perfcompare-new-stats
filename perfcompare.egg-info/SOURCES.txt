@@ -1,0 +1,9 @@
+README.md
+perf_compare_cli_new.py
+pyproject.toml
+perfcompare.egg-info/PKG-INFO
+perfcompare.egg-info/SOURCES.txt
+perfcompare.egg-info/dependency_links.txt
+perfcompare.egg-info/entry_points.txt
+perfcompare.egg-info/requires.txt
+perfcompare.egg-info/top_level.txt

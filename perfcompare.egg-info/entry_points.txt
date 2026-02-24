@@ -1,0 +1,2 @@
+[console_scripts]
+perfcompare = perf_compare_cli_new:main

@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: perfcompare
+Version: 0.1.0
+Requires-Python: >=3.9
+Requires-Dist: scipy
+Requires-Dist: retry
+Requires-Dist: KDEpy
+Requires-Dist: cliffs_delta
+Requires-Dist: pymannkendall
+Requires-Dist: ipywidgets
+Requires-Dist: numpy
+Requires-Dist: requests
+Requires-Dist: tqdm

@@ -685,18 +685,16 @@ def prepare_data_for_pipeline(item, use_replicates):
     return base_data, new_data
 
 
-def extract_chart_data(base_data, new_data):
+def extract_chart_data(base_data, new_data, lower_is_better=True):
     """Extract data for ECharts visualization."""
     from KDEpy import FFTKDE
 
     if len(base_data) == 0 and len(new_data) == 0:
         return None
 
-    # Calculate medians
     base_median = float(np.median(base_data)) if len(base_data) > 0 else 0
     new_median = float(np.median(new_data)) if len(new_data) > 0 else 0
 
-    # Determine range for KDE
     all_data = (
         np.concatenate([base_data, new_data])
         if len(base_data) > 0 and len(new_data) > 0
@@ -706,18 +704,43 @@ def extract_chart_data(base_data, new_data):
     padding = 0.05 * (x_max - x_min) if x_max > x_min else 1
     x_min, x_max = x_min - padding, x_max + padding
 
-    # Generate grid points
     x_grid = np.linspace(x_min, x_max, 200)
 
     base_peaks = []
     new_peaks = []
     try:
-        if len(base_data) > 1:
-            _, base_peak_locs, _, _, _ = fit_kde_modes(base_data)
-            base_peaks = base_peak_locs.tolist()
-        if len(new_data) > 1:
-            _, new_peak_locs, _, _, _ = fit_kde_modes(new_data)
-            new_peaks = new_peak_locs.tolist()
+        def _letters(locs, letter_map):
+            return [{"value": float(loc), "letter": letter_map[i]} for i, loc in enumerate(locs)]
+
+        def _assign_letters(locs, lower_is_better):
+            sorted_idxs = sorted(range(len(locs)),
+                                 key=lambda i: locs[i] if lower_is_better else -locs[i])
+            return {idx: chr(ord('A') + rank) for rank, idx in enumerate(sorted_idxs)}
+
+        def _mode_fracs(data, boundaries, n):
+            assignments = split_per_mode(data, boundaries)
+            return [np.mean(assignments == i) for i in range(n)]
+
+        if len(base_data) > 1 and len(new_data) > 1:
+            base_n, base_locs, _, _, base_bounds = fit_kde_modes(base_data)
+            new_n, new_locs, _, _, new_bounds = fit_kde_modes(new_data)
+            base_fracs = _mode_fracs(base_data, base_bounds, base_n)
+            new_fracs = _mode_fracs(new_data, new_bounds, new_n)
+            pairs, _, unmatched_new = match_modes(base_locs, base_fracs, new_locs, new_fracs)
+            base_letter = _assign_letters(base_locs, lower_is_better)
+            new_letter = {new_i: base_letter[base_i] for base_i, new_i in pairs}
+            next_ord = ord('A') + base_n
+            for new_i in unmatched_new:
+                new_letter[new_i] = chr(next_ord)
+                next_ord += 1
+            base_peaks = _letters(base_locs, base_letter)
+            new_peaks = _letters(new_locs, new_letter)
+        elif len(base_data) > 1:
+            _, base_locs, _, _, _ = fit_kde_modes(base_data)
+            base_peaks = _letters(base_locs, _assign_letters(base_locs, lower_is_better))
+        elif len(new_data) > 1:
+            _, new_locs, _, _, _ = fit_kde_modes(new_data)
+            new_peaks = _letters(new_locs, _assign_letters(new_locs, lower_is_better))
     except Exception:
         pass
 
@@ -936,7 +959,7 @@ def process_single_test(args):
     perf_analysis = analyze_performance_change(item, base_data, new_data, compute_bootstrap)
 
     # Extract chart data for ECharts
-    chart_data = extract_chart_data(base_data, new_data)
+    chart_data = extract_chart_data(base_data, new_data, lower_is_better)
 
     return {
         "suite": suite,
@@ -1452,8 +1475,8 @@ def generate_html_report(results, title="Performance Comparison Report"):
         const newData = chartData.new;
 
         const modeGlobalIdx = {{}};
-        [...(baseData.peaks || []).map((p, i) => ({{ x: p, key: `base_${{i}}` }})),
-         ...(newData.peaks || []).map((p, i) => ({{ x: p, key: `new_${{i}}` }}))]
+        [...(baseData.peaks || []).map((p, i) => ({{ x: p.value, key: `base_${{i}}` }})),
+         ...(newData.peaks || []).map((p, i) => ({{ x: p.value, key: `new_${{i}}` }}))]
             .sort((a, b) => a.x - b.x)
             .forEach((m, gi) => {{ modeGlobalIdx[m.key] = gi; }});
 
@@ -1567,19 +1590,19 @@ def generate_html_report(results, title="Performance Comparison Report"):
                 }}] : []),
                 // Mode lines
                 ...((baseData.peaks || []).map((p, i) => ({{
-                    name: `Base mode ${{i+1}}`,
+                    name: `Base ${{p.letter}}`,
                     type: 'line',
                     markLine: {{
                         silent: true,
-                        data: [{{ xAxis: p, lineStyle: {{ color: '#3498db', type: 'solid', width: 2 }}, label: {{ formatter: `Base mode ${{i+1}}: ${{p.toFixed(2)}}`, distance: [0, modeGlobalIdx[`base_${{i}}`] * 15], color: '#3498db' }} }}]
+                        data: [{{ xAxis: p.value, lineStyle: {{ color: '#3498db', type: 'solid', width: 2 }}, label: {{ formatter: `Base ${{p.letter}}: ${{p.value.toFixed(0)}}`, distance: [0, modeGlobalIdx[`base_${{i}}`] * 15], color: '#3498db' }} }}]
                     }}
                 }}))),
                 ...((newData.peaks || []).map((p, i) => ({{
-                    name: `New mode ${{i+1}}`,
+                    name: `New ${{p.letter}}`,
                     type: 'line',
                     markLine: {{
                         silent: true,
-                        data: [{{ xAxis: p, lineStyle: {{ color: '#e67e22', type: 'solid', width: 2 }}, label: {{ formatter: `New mode ${{i+1}}: ${{p.toFixed(2)}}`, distance: [0, modeGlobalIdx[`new_${{i}}`] * 15], color: '#e67e22' }} }}]
+                        data: [{{ xAxis: p.value, lineStyle: {{ color: '#e67e22', type: 'solid', width: 2 }}, label: {{ formatter: `New ${{p.letter}}: ${{p.value.toFixed(0)}}`, distance: [0, modeGlobalIdx[`new_${{i}}`] * 15], color: '#e67e22' }} }}]
                     }}
                 }}))),
             ]
