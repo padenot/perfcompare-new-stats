@@ -20,9 +20,9 @@ from pathlib import Path
 import requests
 from retry import retry
 from scipy.stats import mannwhitneyu, ks_2samp, shapiro
-from scipy.signal import find_peaks
-from scipy.ndimage import gaussian_filter1d
 from scipy.stats import bootstrap
+from scipy.signal import argrelmax
+from scipy.optimize import linear_sum_assignment
 from KDEpy import FFTKDE
 
 try:
@@ -147,68 +147,258 @@ def summarize_data(series):
     return pd.DataFrame(summary, index=[0])
 
 
-def count_modes(x, y, min_prom_frac=0.02, max_prom_frac=0.2):
-    """Count modes in KDE distribution."""
-    y_smooth = gaussian_filter1d(y, sigma=2)
-    dy = np.gradient(y_smooth, x)
-    noise_est = np.percentile(np.abs(dy), 90)
-    max_y = np.max(y_smooth)
-    prom_est = np.clip(noise_est, min_prom_frac * max_y, max_prom_frac * max_y)
-    dx = x[1] - x[0]
-    x_range = x[-1] - x[0]
-    min_distance = max(1, int((x_range * 0.05) / dx))
-    peaks, _ = find_peaks(y_smooth, prominence=prom_est, distance=min_distance)
-    return len(peaks), x[peaks], prom_est
+def fit_kde_modes(data, valley_threshold=0.5, min_peak_fraction=0.05, min_data_fraction=0.05):
+    """Detect modes via KDE with ISJ bandwidth and a relative valley-depth criterion.
+
+    Two peaks are distinct modes only when the KDE valley between them drops below
+    valley_threshold * min(peak1_density, peak2_density), AND each mode must
+    contain at least min_data_fraction of the data points.
+
+    Returns (n_modes, peak_locations, x_grid, y_kde, split_boundaries).
+    """
+    fallback = (1, np.array([np.median(data)]), None, None, [])
+    if len(data) < 4:
+        return fallback
+
+    p1, p99 = np.percentile(data, [1, 99])
+    data_fit = data[(data >= p1) & (data <= p99)]
+    if len(data_fit) < 4:
+        data_fit = data
+
+    try:
+        x, y = FFTKDE(kernel="gaussian", bw="ISJ").fit(data_fit).evaluate()
+    except Exception:
+        return fallback
+
+    peak_idxs = argrelmax(y, order=3)[0]
+    peak_idxs = peak_idxs[y[peak_idxs] >= min_peak_fraction * y.max()]
+
+    if len(peak_idxs) == 0:
+        return 1, np.array([x[np.argmax(y)]]), x, y, []
+
+    good = [peak_idxs[0]]
+    for nxt in peak_idxs[1:]:
+        prev = good[-1]
+        valley = y[prev:nxt + 1].min()
+        if valley < valley_threshold * min(y[prev], y[nxt]):
+            good.append(nxt)
+        elif y[nxt] > y[good[-1]]:
+            good[-1] = nxt
+
+    boundaries = []
+    for i in range(len(good) - 1):
+        seg = y[good[i]:good[i + 1] + 1]
+        boundaries.append(x[good[i] + np.argmin(seg)])
+
+    # Drop modes that contain too few data points
+    assignments = np.searchsorted(boundaries, data)
+    keep = [i for i in range(len(good)) if np.mean(assignments == i) >= min_data_fraction]
+    if len(keep) < 2:
+        return 1, np.array([x[good[np.argmax(y[good])]]]), x, y, []
+
+    good = [good[i] for i in keep]
+    boundaries = []
+    for i in range(len(good) - 1):
+        seg = y[good[i]:good[i + 1] + 1]
+        boundaries.append(x[good[i] + np.argmin(seg)])
+
+    return len(good), x[np.array(good)], x, y, boundaries
 
 
-def find_mode_interval(x, y, peaks):
-    """Find intervals between modes."""
-    x = np.asarray(x)
-    y = np.asarray(y)
-    peak_xs = sorted(peaks)
-    peak_idxs = [np.searchsorted(x, px) for px in peaks]
-    if len(peaks) == 0:
-        return [(x[0], x[-1])]
-
-    valleys = []
-    for i in range(len(peaks) - 1):
-        start = peak_idxs[i]
-        end = peak_idxs[i + 1]
-        valley_idx = start + np.argmin(y[start : end + 1])
-        valleys.append(valley_idx)
-
-    edges = [0] + valleys + [len(x) - 1]
-    intervals = [(x[edges[i]], x[edges[i + 1]]) for i in range(len(edges) - 1)]
-    return intervals
+def split_per_mode(data, boundaries):
+    """Assign each data point to a mode index using valley boundaries."""
+    return np.searchsorted(boundaries, data)
 
 
-def split_per_mode(data, intervals):
-    """Split data into modes based on intervals."""
-    assignments = []
-    for val in data:
-        for i, (start, end) in enumerate(intervals):
-            if start <= val <= end:
-                assignments.append(i)
-                break
-        else:
-            assignments.append(None)
-    return np.array(assignments)
+def match_modes(base_locs, base_fracs, new_locs, new_fracs):
+    """Match base modes to new modes using combined location+weight cost (Hungarian algorithm).
+
+    Both distance and weight difference are normalized to [0,1] and averaged equally,
+    so a large weight mismatch can override a small location difference.
+
+    Returns (pairs, unmatched_base_indices, unmatched_new_indices).
+    """
+    if len(base_locs) == 0 or len(new_locs) == 0:
+        return [], list(range(len(base_locs))), list(range(len(new_locs)))
+
+    all_locs = np.concatenate([base_locs, new_locs])
+    loc_range = max(all_locs.max() - all_locs.min(), 1.0)
+    dist_norm = np.abs(base_locs[:, None] - new_locs[None, :]) / loc_range
+    weight_diff = np.abs(np.array(base_fracs)[:, None] - np.array(new_fracs)[None, :])
+    cost = 0.5 * dist_norm + 0.5 * weight_diff
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    pairs = list(zip(row_ind.tolist(), col_ind.tolist()))
+    matched_base = set(row_ind.tolist())
+    matched_new = set(col_ind.tolist())
+    unmatched_base = [i for i in range(len(base_locs)) if i not in matched_base]
+    unmatched_new = [j for j in range(len(new_locs)) if j not in matched_new]
+    return pairs, unmatched_base, unmatched_new
 
 
 def bootstrap_median_diff_ci(a, b, n_iter=1000, alpha=0.05):
-    """Bootstrap confidence interval for median difference."""
+    """Bootstrap confidence interval for median difference.
+
+    Uses vectorized operations for efficiency with numpy.
+    """
+    def statistic(x, y, axis=-1):
+        return np.median(y, axis=axis) - np.median(x, axis=axis)
+
     data = (a, b)
     res = bootstrap(
         data,
-        statistic=lambda *args: np.median(args[1]) - np.median(args[0]),
+        statistic=statistic,
         n_resamples=n_iter,
         confidence_level=1 - alpha,
         method="percentile",
-        vectorized=False,
+        vectorized=True,
         paired=False,
-        random_state=None,
+        random_state=42,
     )
     return np.median(b) - np.median(a), res.confidence_interval
+
+
+def generate_explanation(
+    base_peak_locs, base_fracs,
+    new_peak_locs, new_fracs,
+    pairs, unmatched_base, unmatched_new,
+    pair_shifts,
+    lower_is_better,
+    unit="ms",
+    base_letter=None,
+    new_letter=None,
+):
+    """Produce a plain-English summary of the performance change for non-statisticians."""
+
+    if base_letter is None:
+        base_letter = {}
+    if new_letter is None:
+        new_letter = {}
+
+    def frac_words(f):
+        if f >= 0.92: return "virtually all"
+        if f >= 0.75: return "the large majority"
+        if f >= 0.55: return "most"
+        if f >= 0.45: return "roughly half"
+        if f >= 0.25: return "a significant portion"
+        if f >= 0.10: return "a minority"
+        return "a small fraction"
+
+    def shift_words(shift, ci_low, ci_high):
+        if ci_low < 0 < ci_high:
+            return None, f"no statistically significant change (the ~{abs(shift):.0f}{unit} difference is within noise)"
+        improved = (shift < 0) == lower_is_better
+        lo = min(abs(ci_low), abs(ci_high))
+        hi = max(abs(ci_low), abs(ci_high))
+        word = "improved" if improved else "regressed"
+        return improved, f"{word} by {lo:.0f}–{hi:.0f}{unit}"
+
+    def speed_label(loc, locs):
+        sorted_locs = sorted(locs) if lower_is_better else sorted(locs, reverse=True)
+        n = len(sorted_locs)
+        rank = sorted_locs.index(loc)
+        if n == 1: return ""
+        if n == 2: return "fast" if rank == 0 else "slow"
+        if rank == 0: return "fastest"
+        if rank == n - 1: return "slowest"
+        return "intermediate"
+
+    n_base = len(base_peak_locs)
+    n_new = len(new_peak_locs)
+    all_locs = np.concatenate([base_peak_locs, new_peak_locs])
+    overall_center = np.median(all_locs)
+
+    total_modes = n_base + len(unmatched_new)
+    if total_modes > 3:
+        return (
+            f"This benchmark shows {total_modes} distinct execution patterns, "
+            f"which is too complex to summarise in plain language. "
+            f"Please refer to the KDE chart for a visual overview."
+        )
+
+    # --- Unimodal simple case ---
+    if n_base == 1 and n_new == 1 and len(pairs) == 1:
+        shift, cl, ch = pair_shifts[0][2], pair_shifts[0][3], pair_shifts[0][4]
+        is_improvement, phrase = shift_words(shift, cl, ch)
+        base_loc, new_loc = base_peak_locs[0], new_peak_locs[0]
+        if is_improvement is None:
+            return (
+                f"Runs behaved consistently in both revisions. "
+                f"The typical time ({base_loc:.0f}{unit} → {new_loc:.0f}{unit}) shows {phrase}."
+            )
+        elif is_improvement:
+            return (
+                f"Performance improved clearly and consistently: "
+                f"the typical run went from {base_loc:.0f}{unit} to {new_loc:.0f}{unit} ({phrase})."
+            )
+        else:
+            return (
+                f"Performance regressed: "
+                f"the typical run slowed from {base_loc:.0f}{unit} to {new_loc:.0f}{unit} ({phrase})."
+            )
+
+    # --- Multimodal case ---
+    parts = []
+
+    if n_base == 1:
+        intro = f"The base revision ran consistently at around {base_peak_locs[0]:.0f}{unit}."
+    else:
+        descs = [
+            f"<b>Mode {base_letter.get(i, chr(ord('A')+i))}</b> at ~{loc:.0f}{unit} ({f:.0%})"
+            for i, (loc, f) in enumerate(zip(base_peak_locs, base_fracs))
+        ]
+        intro = f"The base revision showed {n_base} distinct execution patterns: {', and '.join(descs)}."
+    parts.append(intro)
+
+    mode_lines = []
+    sort_key = (lambda x: base_peak_locs[x[0]]) if lower_is_better else (lambda x: -base_peak_locs[x[0]])
+    for bi, ni, shift, cl, ch in sorted(pair_shifts, key=sort_key):
+        base_loc = base_peak_locs[bi]
+        new_loc = new_peak_locs[ni]
+        base_frac = base_fracs[bi]
+        new_frac = new_fracs[ni]
+        letter = base_letter.get(bi, "?")
+        slabel = speed_label(base_loc, list(base_peak_locs))
+        _, phrase = shift_words(shift, cl, ch)
+
+        delta_frac = new_frac - base_frac
+        if abs(delta_frac) >= 0.15:
+            dir_word = "more" if delta_frac > 0 else "less"
+            frac_tail = f" It is now {dir_word} common: {base_frac:.0%} → {new_frac:.0%} of runs."
+        else:
+            frac_tail = ""
+
+        mode_lines.append(
+            f"<b>Mode {letter}</b> ({slabel}, ~{base_loc:.0f}{unit}, {base_frac:.0%} of base runs)"
+            f" {phrase} — now at ~{new_loc:.0f}{unit}.{frac_tail}"
+        )
+
+    for bi in unmatched_base:
+        loc = base_peak_locs[bi]
+        frac = base_fracs[bi]
+        letter = base_letter.get(bi, "?")
+        slabel = speed_label(loc, list(base_peak_locs))
+        is_slow = (lower_is_better and loc >= overall_center) or (not lower_is_better and loc <= overall_center)
+        valence = "This is a positive change — that slow behavior has been eliminated." if is_slow \
+            else "A previously fast pattern no longer occurs — this may be worth investigating."
+        mode_lines.append(
+            f"<b>Mode {letter}</b> ({slabel}, ~{loc:.0f}{unit}, {frac_words(frac)} of base runs)"
+            f" is absent from the new revision. {valence}"
+        )
+
+    for ni in unmatched_new:
+        loc = new_peak_locs[ni]
+        frac = new_fracs[ni]
+        letter = new_letter.get(ni, "?")
+        is_slow = (lower_is_better and loc >= overall_center) or (not lower_is_better and loc <= overall_center)
+        valence = "This new slow behavior warrants investigation." if is_slow \
+            else "This new fast pattern is a positive development."
+        mode_lines.append(
+            f"<b>Mode {letter}</b> (new, ~{loc:.0f}{unit}, {frac_words(frac)} of new runs): {valence}"
+        )
+
+    parts.append("<br>".join(mode_lines))
+    return "<br><br>".join(parts)
 
 
 def interpret_effect_size(effect_size):
@@ -223,7 +413,7 @@ def interpret_effect_size(effect_size):
         return "Large difference"
 
 
-def process_new(base_rev, new_rev, header, lower_is_better=True):
+def process_new(base_rev, new_rev, header, lower_is_better=True, unit="ms"):
     """Complete statistical analysis pipeline."""
     from scipy import stats
 
@@ -291,72 +481,88 @@ def process_new(base_rev, new_rev, header, lower_is_better=True):
     )
     display(Markdown(f"**Cliff's Delta**: {delta:.2f} → {interpretation}"))
 
-    x_without, y_without = (
-        FFTKDE(kernel="gaussian", bw="silverman").fit(without_patch).evaluate()
-    )
-    x_with, y_with = (
-        FFTKDE(kernel="gaussian", bw="silverman").fit(with_patch).evaluate()
-    )
+    base_mode_count, base_peak_locs, _, _, base_boundaries = fit_kde_modes(without_patch)
+    new_mode_count, new_peak_locs, _, _, new_boundaries = fit_kde_modes(with_patch)
 
-    base_mode_count, base_peak_locs, base_prom = count_modes(x_without, y_without)
-    new_mode_count, new_peak_locs, new_prom = count_modes(x_with, y_with)
+    def mode_fractions(data, boundaries, n_modes):
+        assignments = split_per_mode(data, boundaries)
+        return [np.mean(assignments == i) for i in range(n_modes)]
 
-    display(
-        Markdown(
-            f"Estimated modes (Base): {base_mode_count} (location: {base_peak_locs}, prominence: {base_prom})"
-        )
+    base_fracs = mode_fractions(without_patch, base_boundaries, base_mode_count)
+    new_fracs = mode_fractions(with_patch, new_boundaries, new_mode_count)
+
+    per_mode_without = split_per_mode(without_patch, base_boundaries)
+    per_mode_with = split_per_mode(with_patch, new_boundaries)
+    pairs, unmatched_base, unmatched_new = match_modes(base_peak_locs, base_fracs, new_peak_locs, new_fracs)
+
+    # Assign letters A, B, C… to base modes sorted fast→slow
+    base_sorted = sorted(range(base_mode_count),
+                         key=lambda i: base_peak_locs[i] if lower_is_better else -base_peak_locs[i])
+    base_letter = {idx: chr(ord('A') + rank) for rank, idx in enumerate(base_sorted)}
+
+    # Matched new modes inherit the base letter; unmatched new get fresh letters
+    new_letter = {new_i: base_letter[base_i] for base_i, new_i in pairs}
+    next_ord = ord('A') + base_mode_count
+    for new_i in unmatched_new:
+        new_letter[new_i] = chr(next_ord)
+        next_ord += 1
+
+    base_mode_str = ", ".join(
+        f"{base_letter[i]}: {loc:.1f} ({f:.0%})"
+        for i, (loc, f) in enumerate(zip(base_peak_locs, base_fracs))
     )
-    display(
-        Markdown(
-            f"Estimated modes (New): {new_mode_count} (location: {new_peak_locs}, prominence: {new_prom})"
-        )
+    new_mode_str = ", ".join(
+        f"{new_letter[i]}: {loc:.1f} ({f:.0%})"
+        for i, (loc, f) in enumerate(zip(new_peak_locs, new_fracs))
     )
+    print(f"Modes (Base): {base_mode_count} → {base_mode_str}")
+    print(f"Modes (New):  {new_mode_count} → {new_mode_str}")
 
     if base_mode_count > 1:
-        display(Markdown("⚠️  Warning: Base revision distribution appears multimodal!"))
+        print("⚠️  Base revision distribution appears multimodal!")
     if new_mode_count > 1:
-        display(Markdown("⚠️  Warning: New revision distribution appears multimodal!"))
+        print("⚠️  New revision distribution appears multimodal!")
 
-    if base_mode_count != new_mode_count:
-        display(
-            Markdown(
-                "⚠️  Warning: mode count between base and new revision different, look at the KDE!"
-            )
-        )
+    pair_shifts = []
+    for base_i, new_i in pairs:
+        base_loc = base_peak_locs[base_i]
+        new_loc = new_peak_locs[new_i]
+        letter = base_letter[base_i]
+        ref_vals = without_patch[per_mode_without == base_i]
+        new_vals = with_patch[per_mode_with == new_i]
 
-    if base_mode_count == new_mode_count:
-        base_intervals = find_mode_interval(x_without, y_without, base_peak_locs)
-        new_intervals = find_mode_interval(x_with, y_with, new_peak_locs)
-        per_mode_without = split_per_mode(without_patch, base_intervals)
-        per_mode_with = split_per_mode(with_patch, new_intervals)
-        for i, (start, end) in enumerate(base_intervals):
-            ref_vals = without_patch[per_mode_without == i]
-            new_vals = with_patch[per_mode_with == i]
+        if len(ref_vals) == 0 or len(new_vals) == 0:
+            print(f"Mode {letter}: Not enough data to compare.")
+            continue
 
-            if len(ref_vals) == 0 or len(new_vals) == 0:
-                print(
-                    f"Mode {i + 1} [{start:.2f}, {end:.2f}]: Not enough data to compare."
-                )
-                continue
+        shift, (ci_low, ci_high) = bootstrap_median_diff_ci(ref_vals, new_vals)
+        pair_shifts.append((base_i, new_i, shift, ci_low, ci_high))
+        print(f"Mode {letter} ({base_loc:.1f} → {new_loc:.1f}, base {base_fracs[base_i]:.0%}, new {new_fracs[new_i]:.0%}):")
+        print(f"  Median shift: {shift:+.3f} (95% CI: {ci_low:+.3f} to {ci_high:+.3f})")
+        print(f"  → ", end="")
+        if ci_low > 0:
+            print("Performance regressed (median increased)" if lower_is_better else "Performance improved (median increased)")
+        elif ci_high < 0:
+            print("Performance improved (median decreased)" if lower_is_better else "Performance regressed (median decreased)")
+        else:
+            print("No significant shift")
 
-            shift, (ci_low, ci_high) = bootstrap_median_diff_ci(ref_vals, new_vals)
-            print(f"Mode {i + 1} [{start:.2f}, {end:.2f}]:")
-            print(
-                f"  Median shift: {shift:+.3f} (95% CI: {ci_low:+.3f} to {ci_high:+.3f})"
-            )
-            print(f"  → Interpretation: ", end="")
-            if ci_low > 0:
-                if lower_is_better:
-                    print("Performance regressed (median increased)")
-                else:
-                    print("Performance improved (median increased)")
-            elif ci_high < 0:
-                if lower_is_better:
-                    print("Performance improved (median decreased)")
-                else:
-                    print("Performance regressed (median decreased)")
-            else:
-                print("No significant shift")
+    for base_i in unmatched_base:
+        print(f"Mode {base_letter[base_i]} ({base_peak_locs[base_i]:.1f}, {base_fracs[base_i]:.0%} of base): absent in new revision")
+
+    for new_i in unmatched_new:
+        print(f"Mode {new_letter[new_i]} ({new_peak_locs[new_i]:.1f}, {new_fracs[new_i]:.0%} of new): newly appeared")
+
+    return generate_explanation(
+        base_peak_locs, base_fracs,
+        new_peak_locs, new_fracs,
+        pairs, unmatched_base, unmatched_new,
+        pair_shifts,
+        lower_is_better,
+        unit,
+        base_letter,
+        new_letter,
+    )
 
 
 def parse_perf_compare_url(url):
@@ -377,15 +583,32 @@ def parse_perf_compare_url(url):
         if not all([base_repo, base_rev, new_repo, new_rev, framework]):
             raise ValueError("Missing required parameters in URL")
 
-        api_url = (
-            f"https://treeherder.mozilla.org/api/perfcompare/results/"
-            f"?base_repository={base_repo}"
-            f"&base_revision={base_rev}"
-            f"&new_repository={new_repo}"
-            f"&new_revision={new_rev}"
-            f"&framework={framework}"
-            f"&no_subtests=true"
-        )
+        is_subtests = "subtests-compare-results" in parsed.path
+        if is_subtests:
+            base_sig = params.get("baseParentSignature", [""])[0]
+            new_sig = params.get("newParentSignature", [""])[0]
+            if not all([base_sig, new_sig]):
+                raise ValueError("Missing baseParentSignature or newParentSignature in subtests URL")
+            api_url = (
+                f"https://treeherder.mozilla.org/api/perfcompare/results/"
+                f"?base_repository={base_repo}"
+                f"&base_revision={base_rev}"
+                f"&new_repository={new_repo}"
+                f"&new_revision={new_rev}"
+                f"&framework={framework}"
+                f"&base_parent_signature={base_sig}"
+                f"&new_parent_signature={new_sig}"
+            )
+        else:
+            api_url = (
+                f"https://treeherder.mozilla.org/api/perfcompare/results/"
+                f"?base_repository={base_repo}"
+                f"&base_revision={base_rev}"
+                f"&new_repository={new_repo}"
+                f"&new_revision={new_rev}"
+                f"&framework={framework}"
+                f"&no_subtests=true"
+            )
 
         # Decode search term if present (handles URL encoding like + for space)
         if search_term:
@@ -486,18 +709,32 @@ def extract_chart_data(base_data, new_data):
     # Generate grid points
     x_grid = np.linspace(x_min, x_max, 200)
 
+    base_peaks = []
+    new_peaks = []
+    try:
+        if len(base_data) > 1:
+            _, base_peak_locs, _, _, _ = fit_kde_modes(base_data)
+            base_peaks = base_peak_locs.tolist()
+        if len(new_data) > 1:
+            _, new_peak_locs, _, _, _ = fit_kde_modes(new_data)
+            new_peaks = new_peak_locs.tolist()
+    except Exception:
+        pass
+
     chart_data = {
         "base": {
             "median": base_median,
             "sample_count": len(base_data),
             "kde_x": [],
             "kde_y": [],
+            "peaks": base_peaks,
         },
         "new": {
             "median": new_median,
             "sample_count": len(new_data),
             "kde_x": [],
             "kde_y": [],
+            "peaks": new_peaks,
         },
     }
 
@@ -521,10 +758,11 @@ def extract_chart_data(base_data, new_data):
     return chart_data
 
 
-def analyze_performance_change(item, base_data, new_data):
+def analyze_performance_change(item, base_data, new_data, compute_bootstrap=True):
     """Analyze performance change using our pipeline calculations only."""
     from cliffs_delta import cliffs_delta
     from scipy.stats import mannwhitneyu
+    import time
 
     # Only get the direction preference from API (metadata, not calculation)
     lower_is_better = item.get("lower_is_better", True)
@@ -552,6 +790,33 @@ def analyze_performance_change(item, base_data, new_data):
             cles_explanation = (
                 f"{1 - cles:.0%} chance a new value is greater than a base value"
             )
+
+        # Check if distributions are multimodal and if per-mode analysis is available
+        is_multimodal = False
+        has_per_mode_analysis = False
+        if compute_bootstrap and len(base_data) > 1 and len(new_data) > 1:
+            try:
+                base_mode_count, *_ = fit_kde_modes(base_data)
+                new_mode_count, *_ = fit_kde_modes(new_data)
+                is_multimodal = (base_mode_count > 1 or new_mode_count > 1)
+                # Per-mode analysis only available if both have same number of modes
+                has_per_mode_analysis = (base_mode_count == new_mode_count and is_multimodal)
+            except:
+                pass
+
+        # Bootstrap confidence interval for median difference
+        # Skip if multimodal AND per-mode analysis is available (to avoid confusion)
+        # Show if unimodal OR if multimodal but no per-mode analysis available
+        bootstrap_time = 0
+        if compute_bootstrap and not has_per_mode_analysis:
+            start_time = time.perf_counter()
+            _, ci = bootstrap_median_diff_ci(base_data, new_data, n_iter=1000)
+            bootstrap_time = time.perf_counter() - start_time
+            ci_low = float(ci.low)
+            ci_high = float(ci.high)
+        else:
+            ci_low = None
+            ci_high = None
 
         # Interpret effect size
         if abs(cliffs_delta_value) < 0.15:
@@ -584,6 +849,11 @@ def analyze_performance_change(item, base_data, new_data):
         effect_size = "Unknown"
         direction = "No data"
         color_class = "neutral"
+        ci_low = None
+        ci_high = None
+        bootstrap_time = 0
+        is_multimodal = False
+        has_per_mode_analysis = False
 
     return {
         "direction": direction,
@@ -595,12 +865,17 @@ def analyze_performance_change(item, base_data, new_data):
         "cles": cles,
         "cles_explanation": cles_explanation,
         "lower_is_better": lower_is_better,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "bootstrap_time": bootstrap_time,
+        "is_multimodal": is_multimodal,
+        "has_per_mode_analysis": has_per_mode_analysis,
     }
 
 
 def process_single_test(args):
     """Process a single test item for parallel processing."""
-    item, index, use_replicates = args
+    item, index, use_replicates, compute_bootstrap = args
 
     warnings.filterwarnings("ignore")
 
@@ -635,21 +910,19 @@ def process_single_test(args):
     # Capture statistical analysis from pipeline
     output_buffer = io.StringIO()
 
+    lower_is_better = item.get("lower_is_better", True)
+    unit = item.get("base_measurement_unit", "ms") or "ms"
+    explanation = ""
+
     try:
         with redirect_stdout(output_buffer):
-            # Create header for this test
             header = f"{suite} - {test} ({platform})"
+            explanation = process_new(base_data_3d, new_data_3d, header, lower_is_better, unit)
 
-            lower_is_better = item.get("lower_is_better", True)
-            # Run full pipeline processing to get statistical analysis
-            process_new(base_data_3d, new_data_3d, header, lower_is_better)
-
-        # Parse and clean output
         output_text = output_buffer.getvalue()
         lines = output_text.split("\n")
         cleaned_lines = []
         for line in lines:
-            # Skip object representations but keep meaningful content
             if "<IPython" not in line and line.strip():
                 cleaned_lines.append(line)
 
@@ -660,7 +933,7 @@ def process_single_test(args):
         statistical_analysis = f"Statistical analysis failed: {str(e)}"
 
     # Analyze performance change (our pipeline only)
-    perf_analysis = analyze_performance_change(item, base_data, new_data)
+    perf_analysis = analyze_performance_change(item, base_data, new_data, compute_bootstrap)
 
     # Extract chart data for ECharts
     chart_data = extract_chart_data(base_data, new_data)
@@ -670,6 +943,7 @@ def process_single_test(args):
         "test": test,
         "platform": platform,
         "chart_data": chart_data,
+        "explanation": explanation,
         "statistical_analysis": statistical_analysis,
         "base_sample_count": len(base_data),
         "new_sample_count": len(new_data),
@@ -702,7 +976,7 @@ def categorize_results(results):
     return categories
 
 
-def process_results(data, use_replicates, limit=None, workers=None):
+def process_results(data, use_replicates, limit=None, workers=None, compute_bootstrap=True):
     """Process the fetched performance data through parallel processing."""
     results = []
 
@@ -738,17 +1012,39 @@ def process_results(data, use_replicates, limit=None, workers=None):
     print(
         f"\nProcessing {len(items_with_data)} test results using {workers} workers..."
     )
+    if compute_bootstrap:
+        print("Bootstrap CI enabled (1000 resamples per test)")
 
     # Prepare arguments for parallel processing
-    task_args = [(item, i, use_replicates) for i, item in enumerate(items_with_data)]
+    task_args = [(item, i, use_replicates, compute_bootstrap) for i, item in enumerate(items_with_data)]
 
     # Process in parallel with progress bar
+    import time
+    start_time = time.perf_counter()
+
     with Pool(processes=workers) as pool:
         with tqdm(total=len(task_args), desc="Processing tests") as pbar:
             for result in pool.imap(process_single_test, task_args):
                 if result is not None:
                     results.append(result)
                 pbar.update()
+
+    total_time = time.perf_counter() - start_time
+
+    if compute_bootstrap:
+        bootstrap_times = [r['perf_analysis']['bootstrap_time'] for r in results]
+        total_bootstrap_time = sum(bootstrap_times)
+        avg_bootstrap_time = np.mean(bootstrap_times)
+        median_bootstrap_time = np.median(bootstrap_times)
+        print(f"\nTiming Statistics:")
+        print(f"  Wall clock time: {total_time:.2f}s ({len(results)/total_time:.1f} tests/sec)")
+        print(f"  Parallelization: {workers} workers")
+        print(f"\nBootstrap Performance (per test):")
+        print(f"  Average: {avg_bootstrap_time*1000:.1f}ms")
+        print(f"  Median:  {median_bootstrap_time*1000:.1f}ms")
+        print(f"  Total (sum of all): {total_bootstrap_time:.2f}s")
+        print(f"\nEfficiency: Bootstrap adds ~{avg_bootstrap_time*1000:.0f}ms per test")
+        print(f"            Parallelized across {workers} workers = ~{(total_bootstrap_time/workers)*1000:.0f}ms wall clock overhead")
 
     return results
 
@@ -883,14 +1179,20 @@ def generate_html_report(results, title="Performance Comparison Report"):
                                     <div class="stat-row"><span>Samples:</span><span>{new_data["sample_count"]}</span></div>
                                     <div class="stat-row"><span>Median:</span><span>{new_data["median"]:.3f}</span></div>
                                     <div class="stat-row"><span>Delta:</span><span>{perf["delta_value"]:+.3f} ({perf["delta_percentage"]:+.1f}%)</span></div>
+                                    {"" if perf["ci_low"] is None else f'<div class="stat-row"><span>95% CI:</span><span>[{perf["ci_low"]:+.3f}, {perf["ci_high"]:+.3f}]</span></div>'}
                                     <div class="stat-row"><span>Cliff's δ:</span><span>{perf["cliffs_delta"]:+.3f}</span></div>
                                 </div>
                             </div>
                             
                             <div class="cles-section">
-                                <div class="cles-explanation">{perf["cles_explanation"]}</div>
+                                <div class="cles-explanation">
+                                    <strong>Effect Size:</strong> {perf["cles_explanation"]}<br/>
+                                    {"" if perf["ci_low"] is None else f'<strong>Confidence Interval:</strong> We are 95% confident the median difference is between <strong>{perf["ci_low"]:+.3f}</strong> and <strong>{perf["ci_high"]:+.3f}</strong>'}
+                                </div>
                             </div>
-                            
+
+                            {f'<div class="interpretation-section"><div class="interpretation-text">{item["explanation"]}</div></div>' if item.get("explanation") else ""}
+
                             <div class="analysis-section">
                                 <h3>Statistical Analysis</h3>
                                 <div class="analysis-text">{item["statistical_analysis"]}</div>
@@ -997,6 +1299,17 @@ def generate_html_report(results, title="Performance Comparison Report"):
             color: #2c3e50;
             font-size: 1em;
             line-height: 1.4;
+        }}
+        .interpretation-section {{
+            background: #fffbea;
+            border-left: 4px solid #f39c12;
+            padding: 14px 16px;
+            margin: 10px 0;
+        }}
+        .interpretation-text {{
+            font-size: 1.05em;
+            line-height: 1.6;
+            color: #2c3e50;
         }}
         .analysis-section {{
             background: #f8f9fa;
@@ -1137,7 +1450,13 @@ def generate_html_report(results, title="Performance Comparison Report"):
         
         const baseData = chartData.base;
         const newData = chartData.new;
-        
+
+        const modeGlobalIdx = {{}};
+        [...(baseData.peaks || []).map((p, i) => ({{ x: p, key: `base_${{i}}` }})),
+         ...(newData.peaks || []).map((p, i) => ({{ x: p, key: `new_${{i}}` }}))]
+            .sort((a, b) => a.x - b.x)
+            .forEach((m, gi) => {{ modeGlobalIdx[m.key] = gi; }});
+
         const option = {{
             title: {{
                 text: 'Distribution Comparison (KDE)',
@@ -1192,6 +1511,7 @@ def generate_html_report(results, title="Performance Comparison Report"):
                     end: 100
                 }}
             ],
+            grid: {{ top: 80 }},
             xAxis: {{
                 type: 'value',
                 name: 'Value',
@@ -1228,43 +1548,40 @@ def generate_html_report(results, title="Performance Comparison Report"):
                     }},
                     symbol: 'none'
                 }},
-                // Median lines
-                {{
+                // Median lines: only when no mode data available
+                ...(!baseData.peaks || baseData.peaks.length === 0 ? [{{
                     name: 'Base Median',
                     type: 'line',
                     markLine: {{
                         silent: true,
-                        data: [{{
-                            xAxis: baseData.median,
-                            lineStyle: {{
-                                color: '#3498db',
-                                type: 'dashed',
-                                width: 2
-                            }},
-                            label: {{
-                                formatter: `Base: ${{baseData.median.toFixed(2)}}`
-                            }}
-                        }}]
+                        data: [{{ xAxis: baseData.median, lineStyle: {{ color: '#3498db', type: 'dashed', width: 2 }}, label: {{ formatter: `Base: ${{baseData.median.toFixed(2)}}` }} }}]
                     }}
-                }},
-                {{
+                }}] : []),
+                ...(!newData.peaks || newData.peaks.length === 0 ? [{{
                     name: 'New Median',
                     type: 'line',
                     markLine: {{
                         silent: true,
-                        data: [{{
-                            xAxis: newData.median,
-                            lineStyle: {{
-                                color: '#e67e22',
-                                type: 'dashed',
-                                width: 2
-                            }},
-                            label: {{
-                                formatter: `New: ${{newData.median.toFixed(2)}}`
-                            }}
-                        }}]
+                        data: [{{ xAxis: newData.median, lineStyle: {{ color: '#e67e22', type: 'dashed', width: 2 }}, label: {{ formatter: `New: ${{newData.median.toFixed(2)}}` }} }}]
                     }}
-                }}
+                }}] : []),
+                // Mode lines
+                ...((baseData.peaks || []).map((p, i) => ({{
+                    name: `Base mode ${{i+1}}`,
+                    type: 'line',
+                    markLine: {{
+                        silent: true,
+                        data: [{{ xAxis: p, lineStyle: {{ color: '#3498db', type: 'solid', width: 2 }}, label: {{ formatter: `Base mode ${{i+1}}: ${{p.toFixed(2)}}`, distance: [0, modeGlobalIdx[`base_${{i}}`] * 15], color: '#3498db' }} }}]
+                    }}
+                }}))),
+                ...((newData.peaks || []).map((p, i) => ({{
+                    name: `New mode ${{i+1}}`,
+                    type: 'line',
+                    markLine: {{
+                        silent: true,
+                        data: [{{ xAxis: p, lineStyle: {{ color: '#e67e22', type: 'solid', width: 2 }}, label: {{ formatter: `New mode ${{i+1}}: ${{p.toFixed(2)}}`, distance: [0, modeGlobalIdx[`new_${{i}}`] * 15], color: '#e67e22' }} }}]
+                    }}
+                }}))),
             ]
         }};
         
@@ -1297,6 +1614,37 @@ def generate_html_report(results, title="Performance Comparison Report"):
     return html
 
 
+def load_subtest_json(filepath):
+    """Load and parse subtest JSON file format."""
+    with open(filepath, 'r') as f:
+        data = json.load(f)
+
+    results = []
+    for item in data:
+        for test_name, test_data_list in item.items():
+            if not test_data_list:
+                continue
+
+            for test_data in test_data_list:
+                test_info = {
+                    'suite': test_data.get('suite', 'unknown'),
+                    'test': test_data.get('test', test_name),
+                    'platform': test_data.get('platform', 'unknown'),
+                    'header_name': test_data.get('header_name', test_name),
+                    'base_runs': test_data.get('base_runs', []),
+                    'new_runs': test_data.get('new_runs', []),
+                    'base_runs_replicates': test_data.get('base_runs_replicates', []),
+                    'new_runs_replicates': test_data.get('new_runs_replicates', []),
+                    'base_measurement_unit': test_data.get('base_measurement_unit', ''),
+                    'new_measurement_unit': test_data.get('new_measurement_unit', ''),
+                    'lower_is_better': test_data.get('lower_is_better', True),
+                    'is_complete': test_data.get('is_complete', True),
+                }
+                results.append(test_info)
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze performance comparison data from Mozilla perf.compare with interactive charts",
@@ -1307,10 +1655,11 @@ Examples:
   %(prog)s <url> --no-replicates --workers 4
   %(prog)s <url> --limit 20 --output-file interactive_report.html
   %(prog)s <url> --search "sessionrestore many_windows"
+  %(prog)s --from-file perf-compare-all-revisions.json --output-file report.html
         """,
     )
 
-    parser.add_argument("url", help="perf.compare URL or API URL")
+    parser.add_argument("url", nargs='?', help="perf.compare URL or API URL")
     parser.add_argument(
         "--no-replicates",
         action="store_true",
@@ -1353,8 +1702,21 @@ Examples:
         action="store_true",
         help="Clear the cache directory before fetching",
     )
+    parser.add_argument(
+        "--from-file",
+        metavar="FILE",
+        help="Load data from a local JSON file instead of fetching from URL",
+    )
+    parser.add_argument(
+        "--no-bootstrap",
+        action="store_true",
+        help="Disable bootstrap confidence intervals (faster but less informative)",
+    )
 
     args = parser.parse_args()
+
+    if not args.url and not args.from_file:
+        parser.error("Either provide a URL or use --from-file to load from a local file")
 
     # Clear cache if requested
     if args.clear_cache and CACHE_DIR.exists():
@@ -1362,16 +1724,21 @@ Examples:
         shutil.rmtree(CACHE_DIR)
         print(f"Cache cleared: {CACHE_DIR}")
 
-    # Parse URL and extract search term
-    api_url, url_search_term = parse_perf_compare_url(args.url)
-
-    # Use CLI search argument if provided, otherwise use URL search parameter
-    search_term = args.search if args.search else url_search_term
-
     use_replicates = not args.no_replicates
     use_cache = not args.no_cache
 
-    data = fetch_performance_data(api_url, use_replicates, use_cache)
+    if args.from_file:
+        print(f"Loading data from file: {args.from_file}")
+        data = load_subtest_json(args.from_file)
+        search_term = args.search
+    else:
+        # Parse URL and extract search term
+        api_url, url_search_term = parse_perf_compare_url(args.url)
+
+        # Use CLI search argument if provided, otherwise use URL search parameter
+        search_term = args.search if args.search else url_search_term
+
+        data = fetch_performance_data(api_url, use_replicates, use_cache)
 
     # Filter results based on search term
     if search_term:
@@ -1382,7 +1749,8 @@ Examples:
             json.dump(data, f, indent=2)
         print(f"Data saved to {args.save_data}")
 
-    results = process_results(data, use_replicates, args.limit, args.workers)
+    compute_bootstrap = not args.no_bootstrap
+    results = process_results(data, use_replicates, args.limit, args.workers, compute_bootstrap)
 
     if results:
         report_title = args.title if args.title else "Performance Comparison Report"

@@ -1,8 +1,36 @@
 # new stats for perf.compare
 
+## Setup
+
 ```
-uv venv
-source .venv/bin/activate
-uv pip -r install requirements.txt
-python3 perf_compare_cli_new.py https://perf.compare/compare-results\?newRev\=aa76d5841f94617a02ea612c32ca8e29a756cd05\&baseRepo\=try\&baseRev\=7bedadac3ab75ae4d8593814e80ac10b3ebb9e72\&newRepo\=try\&framework\=13  --output-file filename.html --title "Report title"
+uv sync
+```
+
+## Usage
+
+```
+uv run perfcompare <perf.compare URL> [options]
+```
+
+Options:
+
+| Flag | Description |
+|------|-------------|
+| `--output-file FILE` | Output HTML file (default: auto-generated name) |
+| `--title TITLE` | Report title |
+| `--search TERM` | Filter results by test name |
+| `--limit N` | Process only first N results |
+| `--workers N` | Parallel workers (default: auto) |
+| `--no-replicates` | Use aggregated runs instead of replicates |
+| `--no-bootstrap` | Skip bootstrap CIs (faster) |
+| `--save-data FILE` | Save fetched JSON to file |
+| `--from-file FILE` | Load from local JSON instead of fetching |
+| `--no-cache` | Disable request cache |
+| `--clear-cache` | Clear cache before fetching |
+
+## Example
+
+```
+uv run perfcompare "https://perf.compare/compare-results?newRev=aa76d5841f94&baseRepo=try&baseRev=7bedadac3ab7&newRepo=try&framework=13" \
+  --output-file report.html --title "My comparison"
 ```

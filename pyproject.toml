@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "perfcompare"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "scipy",
+    "retry",
+    "KDEpy",
+    "cliffs_delta",
+    "pymannkendall",
+    "ipywidgets",
+    "numpy",
+    "requests",
+    "tqdm",
+]
+
+[project.scripts]
+perfcompare = "perf_compare_cli_new:main"
+
+[tool.setuptools]
+py-modules = ["perf_compare_cli_new"]
