@@ -1195,22 +1195,24 @@ def generate_html_report(results, title="Performance Comparison Report", source_
                         )
 
                         test_results_html.append(f"""
-                        <div class="test-result {perf["color_class"]}" id="{test_id}">
-                            <div class="test-header {perf["color_class"]}">
+                        <details class="test-result {perf["color_class"]}" id="{test_id}">
+                            <summary class="test-header {perf["color_class"]}">
                                 <div class="test-title">{full_header}
                                     <span class="perf-badge {perf["color_class"]}">
                                         {perf["direction"]} ({perf["effect_size"]}) {perf["delta_percentage"]:+.1f}%
                                     </span>
                                 </div>
                                 <div class="test-meta">
-                                    Platform: {item["platform"]} | 
+                                    Platform: {item["platform"]} |
                                     Samples: Base={item["base_sample_count"]}, New={item["new_sample_count"]}
                                 </div>
                                 <div class="direction-indicator">
                                     {direction_text}
                                 </div>
-                            </div>
-                            
+                                <span class="expand-indicator">▶</span>
+                            </summary>
+
+                            <div class="details-body">
                             <div class="stats-grid">
                                 <div class="stats-card">
                                     <div class="stats-title">Base (Without Patch)</div>
@@ -1226,7 +1228,7 @@ def generate_html_report(results, title="Performance Comparison Report", source_
                                     <div class="stat-row"><span>Cliff's δ:</span><span>{perf["cliffs_delta"]:+.3f}</span></div>
                                 </div>
                             </div>
-                            
+
                             <div class="cles-section">
                                 <div class="cles-explanation">
                                     <strong>Effect Size:</strong> {perf["cles_explanation"]}<br/>
@@ -1240,9 +1242,10 @@ def generate_html_report(results, title="Performance Comparison Report", source_
                                 <h3>Statistical Analysis</h3>
                                 <div class="analysis-text">{item["statistical_analysis"]}</div>
                             </div>
-                            
+
                             <div class="chart-container" id="chart-{item["index"]}"></div>
-                        </div>
+                            </div>
+                        </details>
                         """)
 
             test_results_html.append("</div>")
@@ -1288,22 +1291,54 @@ def generate_html_report(results, title="Performance Comparison Report", source_
         
         .test-result {{
             background: white;
-            padding: 15px;
             margin-bottom: 20px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }}
         .test-result.better {{ border-left: 6px solid #27ae60; }}
         .test-result.worse {{ border-left: 6px solid #e74c3c; }}
         .test-result.neutral {{ border-left: 6px solid #7f8c8d; }}
-        
+        details.test-result > summary {{
+            list-style: none;
+            cursor: pointer;
+            display: block;
+        }}
+        details.test-result > summary::-webkit-details-marker {{ display: none; }}
+        .details-body {{
+            padding: 15px;
+        }}
         .test-header {{
             color: white;
             padding: 15px;
-            margin: -15px -15px 15px -15px;
+            position: relative;
         }}
         .test-header.better {{ background: linear-gradient(135deg, #27ae60 0%, #2ecc71 100%); }}
         .test-header.worse {{ background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); }}
         .test-header.neutral {{ background: linear-gradient(135deg, #7f8c8d 0%, #95a5a6 100%); }}
+        .expand-indicator {{
+            position: absolute;
+            right: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 1.1em;
+            opacity: 0.85;
+            transition: transform 0.15s;
+        }}
+        details[open] > summary .expand-indicator {{
+            transform: translateY(-50%) rotate(90deg);
+        }}
+        .expand-collapse-btns {{
+            margin-bottom: 15px;
+        }}
+        .expand-collapse-btns button {{
+            margin-right: 8px;
+            padding: 6px 14px;
+            background: #3498db;
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-size: 0.95em;
+        }}
+        .expand-collapse-btns button:hover {{ background: #2980b9; }}
         
         .test-title {{
             font-size: 1.4em;
@@ -1485,6 +1520,11 @@ def generate_html_report(results, title="Performance Comparison Report", source_
         </div>
     </div>
     
+    <div class="expand-collapse-btns">
+        <button id="expand-all">Expand all</button>
+        <button id="collapse-all">Collapse all</button>
+    </div>
+
     <!-- Index Section -->
     <div class="index">
         <h2>Test Results Index</h2>
@@ -1494,10 +1534,15 @@ def generate_html_report(results, title="Performance Comparison Report", source_
     {"".join(test_results_html)}
     
     <script>
-    // Chart data embedded here
     const chartDataAll = {json.dumps(chart_data, indent=2)};
-    
-    // Function to create interactive charts
+    const initializedCharts = new Set();
+
+    function initChartIfNeeded(containerId) {{
+        if (initializedCharts.has(containerId) || !chartDataAll[containerId]) return;
+        initializedCharts.add(containerId);
+        createChart(containerId, chartDataAll[containerId]);
+    }}
+
     function createChart(containerId, chartData) {{
         const chart = echarts.init(document.getElementById(containerId));
         
@@ -1648,12 +1693,26 @@ def generate_html_report(results, title="Performance Comparison Report", source_
         return chart;
     }}
     
-    // Initialize all charts when page loads
     document.addEventListener('DOMContentLoaded', function() {{
-        Object.keys(chartDataAll).forEach(chartId => {{
-            if (document.getElementById(chartId)) {{
-                createChart(chartId, chartDataAll[chartId]);
-            }}
+        document.querySelectorAll('details.test-result').forEach(details => {{
+            details.addEventListener('toggle', function() {{
+                if (this.open) {{
+                    const chartEl = this.querySelector('.chart-container');
+                    if (chartEl) initChartIfNeeded(chartEl.id);
+                }}
+            }});
+        }});
+
+        document.getElementById('expand-all').addEventListener('click', function() {{
+            document.querySelectorAll('details.test-result').forEach(d => {{
+                d.open = true;
+                const chartEl = d.querySelector('.chart-container');
+                if (chartEl) initChartIfNeeded(chartEl.id);
+            }});
+        }});
+
+        document.getElementById('collapse-all').addEventListener('click', function() {{
+            document.querySelectorAll('details.test-result').forEach(d => d.open = false);
         }});
     }});
     </script>
