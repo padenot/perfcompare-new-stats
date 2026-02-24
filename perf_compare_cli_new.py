@@ -531,7 +531,7 @@ def process_new(base_rev, new_rev, header, lower_is_better=True, unit="ms"):
         ref_vals = without_patch[per_mode_without == base_i]
         new_vals = with_patch[per_mode_with == new_i]
 
-        if len(ref_vals) == 0 or len(new_vals) == 0:
+        if len(ref_vals) < 2 or len(new_vals) < 2:
             print(f"Mode {letter}: Not enough data to compare.")
             continue
 
@@ -851,7 +851,7 @@ def analyze_performance_change(item, base_data, new_data, compute_bootstrap=True
         # Skip if multimodal AND per-mode analysis is available (to avoid confusion)
         # Show if unimodal OR if multimodal but no per-mode analysis available
         bootstrap_time = 0
-        if compute_bootstrap and not has_per_mode_analysis:
+        if compute_bootstrap and not has_per_mode_analysis and len(base_data) >= 2 and len(new_data) >= 2:
             start_time = time.perf_counter()
             _, ci = bootstrap_median_diff_ci(base_data, new_data, n_iter=1000)
             bootstrap_time = time.perf_counter() - start_time
@@ -1092,7 +1092,7 @@ def process_results(data, use_replicates, limit=None, workers=None, compute_boot
     return results
 
 
-def generate_html_report(results, title="Performance Comparison Report"):
+def generate_html_report(results, title="Performance Comparison Report", source_url=None):
     """Generate interactive HTML report with ECharts."""
     categories = categorize_results(results)
 
@@ -1451,6 +1451,15 @@ def generate_html_report(results, title="Performance Comparison Report"):
             opacity: 0.8;
             margin-top: 5px;
         }}
+        .source-url {{
+            font-size: 0.95em;
+            margin-bottom: 15px;
+            color: #555;
+        }}
+        .source-url a {{
+            color: #3498db;
+            word-break: break-all;
+        }}
         .timestamp {{
             text-align: right;
             color: #777;
@@ -1463,7 +1472,8 @@ def generate_html_report(results, title="Performance Comparison Report"):
 </head>
 <body>
     <h1>{title}</h1>
-    
+    {f'<div class="source-url"><a href="{source_url}" target="_blank">{source_url}</a></div>' if source_url else ''}
+
     <div class="summary">
         <div class="metric">
             <span class="metric-label">Total Tests:</span>
@@ -1797,7 +1807,8 @@ Examples:
 
     if results:
         report_title = args.title if args.title else "Performance Comparison Report"
-        html_content = generate_html_report(results, report_title)
+        source_url = args.url if args.url else None
+        html_content = generate_html_report(results, report_title, source_url)
 
         if args.output_file:
             filename = args.output_file
