@@ -565,6 +565,14 @@ def process_new(base_rev, new_rev, header, lower_is_better=True, unit="ms"):
     )
 
 
+def resolve_lando_id(lando_id):
+    """Resolve a Lando landing job ID to a commit hash."""
+    r = requests.get(f"https://api.lando.services.mozilla.com/landing_jobs/{lando_id}")
+    if r.status_code != 200:
+        raise ValueError(f"Failed to resolve lando ID {lando_id}: HTTP {r.status_code}")
+    return r.json()["commit_id"]
+
+
 def parse_perf_compare_url(url):
     """Extract parameters from a perf.compare URL."""
     parsed = urlparse(url)
@@ -574,11 +582,23 @@ def parse_perf_compare_url(url):
         params = parse_qs(parsed.query)
 
         base_repo = params.get("baseRepo", [""])[0]
-        base_rev = params.get("baseRev", [""])[0]
         new_repo = params.get("newRepo", [""])[0]
-        new_rev = params.get("newRev", [""])[0]
         framework = params.get("framework", [""])[0]
         search_term = params.get("search", [""])[0]
+
+        if "compare-lando-results" in parsed.path:
+            base_lando = params.get("baseLando", [""])[0]
+            new_lando = params.get("newLando", [""])[0]
+            if not all([base_repo, base_lando, new_repo, new_lando, framework]):
+                raise ValueError("Missing required parameters in lando URL")
+            print(f"Resolving lando IDs {base_lando} and {new_lando}...")
+            base_rev = resolve_lando_id(base_lando)
+            new_rev = resolve_lando_id(new_lando)
+            print(f"  base: {base_rev}")
+            print(f"  new:  {new_rev}")
+        else:
+            base_rev = params.get("baseRev", [""])[0]
+            new_rev = params.get("newRev", [""])[0]
 
         if not all([base_repo, base_rev, new_repo, new_rev, framework]):
             raise ValueError("Missing required parameters in URL")
