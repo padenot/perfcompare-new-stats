@@ -7,3 +7,5 @@ ipywidgets
 numpy
 requests
 tqdm
+matplotlib
+pandas

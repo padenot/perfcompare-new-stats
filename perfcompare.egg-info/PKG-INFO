@@ -11,3 +11,5 @@ Requires-Dist: ipywidgets
 Requires-Dist: numpy
 Requires-Dist: requests
 Requires-Dist: tqdm
+Requires-Dist: matplotlib
+Requires-Dist: pandas

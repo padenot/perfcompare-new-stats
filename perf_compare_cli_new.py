@@ -275,6 +275,14 @@ def generate_explanation(
     if new_letter is None:
         new_letter = {}
 
+    def fmt_loc(v):
+        a = abs(v)
+        if a < 10:
+            return f"{v:.2f}"
+        if a < 100:
+            return f"{v:.1f}"
+        return f"{v:.0f}"
+
     def frac_words(f):
         if f >= 0.92: return "virtually all"
         if f >= 0.75: return "the large majority"
@@ -286,12 +294,12 @@ def generate_explanation(
 
     def shift_words(shift, ci_low, ci_high):
         if ci_low < 0 < ci_high:
-            return None, f"no statistically significant change (the ~{abs(shift):.0f}{unit} difference is within noise)"
+            return None, f"no statistically significant change (the ~{fmt_loc(abs(shift))}{unit} difference is within noise)"
         improved = (shift < 0) == lower_is_better
         lo = min(abs(ci_low), abs(ci_high))
         hi = max(abs(ci_low), abs(ci_high))
         word = "improved" if improved else "regressed"
-        return improved, f"{word} by {lo:.0f}–{hi:.0f}{unit}"
+        return improved, f"{word} by {fmt_loc(lo)}–{fmt_loc(hi)}{unit}"
 
     def speed_label(loc, locs):
         sorted_locs = sorted(locs) if lower_is_better else sorted(locs, reverse=True)
@@ -324,27 +332,27 @@ def generate_explanation(
         if is_improvement is None:
             return (
                 f"Runs behaved consistently in both revisions. "
-                f"The typical time ({base_loc:.0f}{unit} → {new_loc:.0f}{unit}) shows {phrase}."
+                f"The typical time ({fmt_loc(base_loc)}{unit} → {fmt_loc(new_loc)}{unit}) shows {phrase}."
             )
         elif is_improvement:
             return (
                 f"Performance improved clearly and consistently: "
-                f"the typical run went from {base_loc:.0f}{unit} to {new_loc:.0f}{unit} ({phrase})."
+                f"the typical run went from {fmt_loc(base_loc)}{unit} to {fmt_loc(new_loc)}{unit} ({phrase})."
             )
         else:
             return (
                 f"Performance regressed: "
-                f"the typical run slowed from {base_loc:.0f}{unit} to {new_loc:.0f}{unit} ({phrase})."
+                f"the typical run slowed from {fmt_loc(base_loc)}{unit} to {fmt_loc(new_loc)}{unit} ({phrase})."
             )
 
     # --- Multimodal case ---
     parts = []
 
     if n_base == 1:
-        intro = f"The base revision ran consistently at around {base_peak_locs[0]:.0f}{unit}."
+        intro = f"The base revision ran consistently at around {fmt_loc(base_peak_locs[0])}{unit}."
     else:
         descs = [
-            f"<b>Mode {base_letter.get(i, chr(ord('A')+i))}</b> at ~{loc:.0f}{unit} ({f:.0%})"
+            f"<b>Mode {base_letter.get(i, chr(ord('A')+i))}</b> at ~{fmt_loc(loc)}{unit} ({f:.1%})"
             for i, (loc, f) in enumerate(zip(base_peak_locs, base_fracs))
         ]
         intro = f"The base revision showed {n_base} distinct execution patterns: {', and '.join(descs)}."
@@ -364,13 +372,13 @@ def generate_explanation(
         delta_frac = new_frac - base_frac
         if abs(delta_frac) >= 0.15:
             dir_word = "more" if delta_frac > 0 else "less"
-            frac_tail = f" It is now {dir_word} common: {base_frac:.0%} → {new_frac:.0%} of runs."
+            frac_tail = f" It is now {dir_word} common: {base_frac:.1%} → {new_frac:.1%} of runs."
         else:
             frac_tail = ""
 
         mode_lines.append(
-            f"<b>Mode {letter}</b> ({slabel}, ~{base_loc:.0f}{unit}, {base_frac:.0%} of base runs)"
-            f" {phrase} — now at ~{new_loc:.0f}{unit}.{frac_tail}"
+            f"<b>Mode {letter}</b> ({slabel}, ~{fmt_loc(base_loc)}{unit}, {base_frac:.1%} of base runs)"
+            f" {phrase} — now at ~{fmt_loc(new_loc)}{unit}.{frac_tail}"
         )
 
     for bi in unmatched_base:
@@ -382,7 +390,7 @@ def generate_explanation(
         valence = "This is a positive change — that slow behavior has been eliminated." if is_slow \
             else "A previously fast pattern no longer occurs — this may be worth investigating."
         mode_lines.append(
-            f"<b>Mode {letter}</b> ({slabel}, ~{loc:.0f}{unit}, {frac_words(frac)} of base runs)"
+            f"<b>Mode {letter}</b> ({slabel}, ~{fmt_loc(loc)}{unit}, {frac_words(frac)} of base runs)"
             f" is absent from the new revision. {valence}"
         )
 
@@ -394,7 +402,7 @@ def generate_explanation(
         valence = "This new slow behavior warrants investigation." if is_slow \
             else "This new fast pattern is a positive development."
         mode_lines.append(
-            f"<b>Mode {letter}</b> (new, ~{loc:.0f}{unit}, {frac_words(frac)} of new runs): {valence}"
+            f"<b>Mode {letter}</b> (new, ~{fmt_loc(loc)}{unit}, {frac_words(frac)} of new runs): {valence}"
         )
 
     parts.append("<br>".join(mode_lines))
@@ -827,11 +835,11 @@ def analyze_performance_change(item, base_data, new_data, compute_bootstrap=True
         # Generate CLES explanation
         if cles >= 0.5:
             cles_explanation = (
-                f"{cles:.0%} chance a base value is greater than a new value"
+                f"{cles:.0%} chance the new value is smaller than the base value"
             )
         else:
             cles_explanation = (
-                f"{1 - cles:.0%} chance a new value is greater than a base value"
+                f"{1 - cles:.0%} chance the new value is greater than the base value"
             )
 
         # Check if distributions are multimodal and if per-mode analysis is available
@@ -1195,7 +1203,12 @@ def generate_html_report(results, title="Performance Comparison Report", source_
                         )
 
                         test_results_html.append(f"""
-                        <details class="test-result {perf["color_class"]}" id="{test_id}">
+                        <details class="test-result {perf["color_class"]}" id="{test_id}"
+                            data-cles="{perf["cles"]:.6f}"
+                            data-delta-pct="{perf["delta_percentage"]:.4f}"
+                            data-delta-abs="{perf["delta_value"]:.6f}"
+                            data-cliffs-delta="{perf["cliffs_delta"]:.4f}"
+                            data-lower-is-better="{1 if perf["lower_is_better"] else 0}">
                             <summary class="test-header {perf["color_class"]}">
                                 <div class="test-title">{full_header}
                                     <span class="perf-badge {perf["color_class"]}">
@@ -1339,6 +1352,20 @@ def generate_html_report(results, title="Performance Comparison Report", source_
             font-size: 0.95em;
         }}
         .expand-collapse-btns button:hover {{ background: #2980b9; }}
+        .sort-controls {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-left: 16px;
+        }}
+        .sort-controls label {{ font-size: 0.95em; }}
+        .sort-controls select {{
+            padding: 5px 10px;
+            border-radius: 4px;
+            border: 1px solid #ccc;
+            font-size: 0.95em;
+            cursor: pointer;
+        }}
         
         .test-title {{
             font-size: 1.4em;
@@ -1523,7 +1550,20 @@ def generate_html_report(results, title="Performance Comparison Report", source_
     <div class="expand-collapse-btns">
         <button id="expand-all">Expand all</button>
         <button id="collapse-all">Collapse all</button>
+        <span class="sort-controls">
+            <label for="sort-by">Sort by:</label>
+            <select id="sort-by">
+                <option value="default">Default</option>
+                <option value="cles">Common language effect size</option>
+                <option value="deltaPct">% delta</option>
+                <option value="deltaAbs">Delta</option>
+                <option value="cliffsDelta">Cliff's δ</option>
+            </select>
+            <label><input type="checkbox" id="sort-abs"> |absolute|</label>
+            <label><input type="checkbox" id="sort-asc"> ascending</label>
+        </span>
     </div>
+    <div id="sorted-view" style="display:none"></div>
 
     <!-- Index Section -->
     <div class="index">
@@ -1536,6 +1576,13 @@ def generate_html_report(results, title="Performance Comparison Report", source_
     <script>
     const chartDataAll = {json.dumps(chart_data, indent=2)};
     const initializedCharts = new Set();
+
+    function fmtVal(v) {{
+        const a = Math.abs(v);
+        if (a < 10) return v.toFixed(2);
+        if (a < 100) return v.toFixed(1);
+        return v.toFixed(0);
+    }}
 
     function initChartIfNeeded(containerId) {{
         if (initializedCharts.has(containerId) || !chartDataAll[containerId]) return;
@@ -1652,7 +1699,7 @@ def generate_html_report(results, title="Performance Comparison Report", source_
                     type: 'line',
                     markLine: {{
                         silent: true,
-                        data: [{{ xAxis: baseData.median, lineStyle: {{ color: '#3498db', type: 'dashed', width: 2 }}, label: {{ formatter: `Base: ${{baseData.median.toFixed(2)}}` }} }}]
+                        data: [{{ xAxis: baseData.median, lineStyle: {{ color: '#3498db', type: 'dashed', width: 2 }}, label: {{ formatter: `Base: ${{fmtVal(baseData.median)}}` }} }}]
                     }}
                 }}] : []),
                 ...(!newData.peaks || newData.peaks.length === 0 ? [{{
@@ -1660,7 +1707,7 @@ def generate_html_report(results, title="Performance Comparison Report", source_
                     type: 'line',
                     markLine: {{
                         silent: true,
-                        data: [{{ xAxis: newData.median, lineStyle: {{ color: '#e67e22', type: 'dashed', width: 2 }}, label: {{ formatter: `New: ${{newData.median.toFixed(2)}}` }} }}]
+                        data: [{{ xAxis: newData.median, lineStyle: {{ color: '#e67e22', type: 'dashed', width: 2 }}, label: {{ formatter: `New: ${{fmtVal(newData.median)}}` }} }}]
                     }}
                 }}] : []),
                 // Mode lines
@@ -1669,7 +1716,7 @@ def generate_html_report(results, title="Performance Comparison Report", source_
                     type: 'line',
                     markLine: {{
                         silent: true,
-                        data: [{{ xAxis: p.value, lineStyle: {{ color: '#3498db', type: 'solid', width: 2 }}, label: {{ formatter: `Base ${{p.letter}}: ${{p.value.toFixed(0)}}`, distance: [0, modeGlobalIdx[`base_${{i}}`] * 15], color: '#3498db' }} }}]
+                        data: [{{ xAxis: p.value, lineStyle: {{ color: '#3498db', type: 'solid', width: 2 }}, label: {{ formatter: `Base ${{p.letter}}: ${{fmtVal(p.value)}}`, distance: [0, modeGlobalIdx[`base_${{i}}`] * 15], color: '#3498db' }} }}]
                     }}
                 }}))),
                 ...((newData.peaks || []).map((p, i) => ({{
@@ -1677,7 +1724,7 @@ def generate_html_report(results, title="Performance Comparison Report", source_
                     type: 'line',
                     markLine: {{
                         silent: true,
-                        data: [{{ xAxis: p.value, lineStyle: {{ color: '#e67e22', type: 'solid', width: 2 }}, label: {{ formatter: `New ${{p.letter}}: ${{p.value.toFixed(0)}}`, distance: [0, modeGlobalIdx[`new_${{i}}`] * 15], color: '#e67e22' }} }}]
+                        data: [{{ xAxis: p.value, lineStyle: {{ color: '#e67e22', type: 'solid', width: 2 }}, label: {{ formatter: `New ${{p.letter}}: ${{fmtVal(p.value)}}`, distance: [0, modeGlobalIdx[`new_${{i}}`] * 15], color: '#e67e22' }} }}]
                     }}
                 }}))),
             ]
@@ -1714,6 +1761,61 @@ def generate_html_report(results, title="Performance Comparison Report", source_
         document.getElementById('collapse-all').addEventListener('click', function() {{
             document.querySelectorAll('details.test-result').forEach(d => d.open = false);
         }});
+
+        const sortedView = document.getElementById('sorted-view');
+        const allResults = Array.from(document.querySelectorAll('details.test-result'));
+        const origParent = new Map();
+        const origNext = new Map();
+        allResults.forEach(el => {{
+            origParent.set(el, el.parentNode);
+            origNext.set(el, el.nextSibling);
+        }});
+
+        function applySort() {{
+            const val = document.getElementById('sort-by').value;
+            const useAbs = document.getElementById('sort-abs').checked;
+            const asc = document.getElementById('sort-asc').checked;
+
+            if (val === 'default') {{
+                sortedView.style.display = 'none';
+                document.querySelectorAll('.category-better, .category-worse, .category-neutral')
+                    .forEach(el => el.style.display = '');
+                allResults.forEach(el => {{
+                    const parent = origParent.get(el);
+                    const next = origNext.get(el);
+                    if (next && next.parentNode === parent) {{
+                        parent.insertBefore(el, next);
+                    }} else {{
+                        parent.appendChild(el);
+                    }}
+                }});
+            }} else {{
+                const keyMap = {{cles: 'cles', deltaPct: 'deltaPct', deltaAbs: 'deltaAbs', cliffsDelta: 'cliffsDelta'}};
+                const key = keyMap[val];
+                function normalizedVal(el) {{
+                    const v = parseFloat(el.dataset[key]);
+                    const lib = el.dataset.lowerIsBetter === '1';
+                    if (key === 'deltaPct' || key === 'deltaAbs') return lib ? -v : v;
+                    if (key === 'cliffsDelta') return lib ? v : -v;
+                    if (key === 'cles') return lib ? v : 1 - v;
+                    return v;
+                }}
+                const sorted = [...allResults].sort((a, b) => {{
+                    let av = normalizedVal(a);
+                    let bv = normalizedVal(b);
+                    if (useAbs) {{ av = Math.abs(av); bv = Math.abs(bv); }}
+                    return asc ? av - bv : bv - av;
+                }});
+                sortedView.replaceChildren(...sorted);
+                sortedView.style.display = '';
+                document.querySelectorAll('.category-better, .category-worse, .category-neutral')
+                    .forEach(el => el.style.display = 'none');
+            }}
+        }}
+
+        ['sort-by', 'sort-abs', 'sort-asc'].forEach(id =>
+            document.getElementById(id).addEventListener('change', applySort)
+        );
     }});
     </script>
     
