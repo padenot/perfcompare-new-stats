@@ -4,3 +4,5 @@ KDEpy
 cliffs_delta
 pymannkendall
 ipywidgets
+matplotlib
+pandas
