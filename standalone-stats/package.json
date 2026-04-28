@@ -1,0 +1,9 @@
+{
+  "name": "perf-stats-standalone",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Standalone KDE + bootstrap CI example for perfcompare integration",
+  "scripts": {
+    "example": "node example.mjs"
+  }
+}
