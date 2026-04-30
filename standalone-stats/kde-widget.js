@@ -169,6 +169,7 @@
   // Simplified variant of bootstrapMedianDiffCI from bootstrap-ci.js.
   // Uses Math.random() (non-reproducible) because the widget is interactive
   // and re-runs on slider changes; exact reproducibility is not required here.
+  function arrMedian(arr) {
     if (!arr.length) return NaN;
     var s = arr.slice().sort(function(a, b) { return a - b; });
     var m = s.length >> 1;
@@ -211,6 +212,7 @@
   // Single-mode: one line showing direction, magnitude, and CI.
   // Multi-mode: a verdict header followed by one row per matched/unmatched mode,
   // each with its bootstrap CI, fraction of runs, and path label (fast/mid/slow).
+  function generateBlurb(kd, modesArr) {
     if (modesArr.length < 2) return '';
     var base = modesArr[0], comp = modesArr[1];
     if (!base.peakLocs.length || !comp.peakLocs.length) return '';
