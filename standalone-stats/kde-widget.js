@@ -165,6 +165,63 @@
   function popcount(x) { var c = 0; while (x) { c += x & 1; x >>= 1; } return c; }
   function range(n) { return Array.from({ length: n }, function(_, i) { return i; }); }
 
+  // ── CLES (Vargha-Delaney A) ──────────────────────────────────────────────────
+  // P(comp < base): fraction of random (base, comp) pairs where comp is faster.
+  // 0.5 = no difference, >0.5 = comp faster, <0.5 = comp slower.
+  function cles(base, comp) {
+    var n = base.length, m = comp.length;
+    if (!n || !m) return NaN;
+    var u = 0;
+    for (var i = 0; i < n; i++) {
+      for (var j = 0; j < m; j++) {
+        if (comp[j] < base[i]) u += 1;
+        else if (comp[j] === base[i]) u += 0.5;
+      }
+    }
+    return u / (n * m);
+  }
+
+
+  // Two-tailed permutation test for the rank-sum statistic.
+  // Works for any N — exact for small samples, equivalent to Mann-Whitney for large.
+  // O((n+m) log(n+m)) setup + O(n+m) per iteration.
+  function permutationP(base, comp, nIter) {
+    nIter = nIter || 999;
+    var n = base.length, m = comp.length, total = n + m;
+    if (!n || !m) return NaN;
+    // Assign ranks to the pooled array (average ranks for ties)
+    var pool = Array.prototype.slice.call(base).concat(Array.prototype.slice.call(comp));
+    var order = pool.map(function(_, i) { return i; }).sort(function(a, b) { return pool[a] - pool[b]; });
+    var poolRanks = new Array(total);
+    for (var i = 0; i < total; ) {
+      var j = i;
+      while (j < total && pool[order[j]] === pool[order[i]]) j++;
+      var avgRank = (i + j + 1) / 2;
+      for (var k = i; k < j; k++) poolRanks[order[k]] = avgRank;
+      i = j;
+    }
+    // Observed rank sum for comp (last m entries in pool)
+    var obsSum = 0;
+    for (var i = n; i < total; i++) obsSum += poolRanks[i];
+    var expected = m * (total + 1) / 2;
+    var obsDeviation = Math.abs(obsSum - expected);
+    // Permutation: repeatedly draw m indices without replacement, sum their ranks
+    var indices = pool.map(function(_, i) { return i; });
+    var extreme = 0;
+    for (var iter = 0; iter < nIter; iter++) {
+      // Partial Fisher-Yates: shuffle only the first m slots
+      for (var i = 0; i < m; i++) {
+        var j = i + Math.floor(Math.random() * (total - i));
+        var tmp = indices[i]; indices[i] = indices[j]; indices[j] = tmp;
+      }
+      var rankSum = 0;
+      for (var i = 0; i < m; i++) rankSum += poolRanks[indices[i]];
+      if (Math.abs(rankSum - expected) >= obsDeviation) extreme++;
+
+    }
+    return (extreme + 1) / (nIter + 1);
+  }
+
   // ── bootstrap CI ─────────────────────────────────────────────────────────────
   // Simplified variant of bootstrapMedianDiffCI from bootstrap-ci.js.
   // Uses Math.random() (non-reproducible) because the widget is interactive
@@ -213,9 +270,10 @@
   // Multi-mode: a verdict header followed by one row per matched/unmatched mode,
   // each with its bootstrap CI, fraction of runs, and path label (fast/mid/slow).
   function generateBlurb(kd, modesArr) {
-    if (modesArr.length < 2) return '';
+    var empty = { header: '', detail: '' };
+    if (modesArr.length < 2) return empty;
     var base = modesArr[0], comp = modesArr[1];
-    if (!base.peakLocs.length || !comp.peakLocs.length) return '';
+    if (!base.peakLocs.length || !comp.peakLocs.length) return empty;
 
     var match = matchModes(base.peakLocs, base.fracs, comp.peakLocs, comp.fracs);
 
@@ -237,9 +295,9 @@
       if (!ci95) return '';
       var pct = baseLoc > 0 ? (ci95.shift / baseLoc * 100) : 0;
       var col = sig ? (ci95.shift < 0 ? '#060' : '#b00') : '#555';
-      var arrow = sig ? (ci95.shift < 0 ? '▼\u00a0faster' : '▲\u00a0slower') : 'no\u00a0significant\u00a0change';
+      var arrow = sig ? (ci95.shift < 0 ? '▼\u00a0faster' : '▲\u00a0slower') : 'no\u00a0reliable\u00a0change';
       return '<span style="color:' + col + ';font-weight:' + (sig ? 'bold' : 'normal') + '">' + arrow + '</span>' +
-        '\u2002' + (ci95.shift >= 0 ? '+' : '') + fmtVal(ci95.shift) + '\u00a0samples/iter' +
+        '\u2002' + (ci95.shift >= 0 ? '+' : '') + fmtVal(ci95.shift) + '\u00a0' + (kd.unit || 'samples/iter') +
         (sig && baseLoc > 0 ? '\u00a0(' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%)' : '') +
         '\u2002<span style="color:#555">95%\u00a0CI\u00a0[' +
         (ci95.lo >= 0 ? '+' : '') + fmtVal(ci95.lo) + ',\u2009' +
@@ -264,26 +322,73 @@
     var sigCount = pairData.filter(function(r) { return r.sig; }).length;
     var improvements = pairData.filter(function(r) { return r.sig && r.ci95 && r.ci95.shift < 0; });
     var regressions  = pairData.filter(function(r) { return r.sig && r.ci95 && r.ci95.shift > 0; });
-    var lines = [];
+    var rawBase = kd.rawSamples && kd.rawSamples[0];
+    var rawComp = kd.rawSamples && kd.rawSamples[1];
+    var clesPct = (rawBase && rawComp) ? cles(rawBase, rawComp) : NaN;
+    var unit = kd.unit || 'samples/iter';
+    var headerLines = [];
+    var detailLines = [];
+
+    // ── prominent header (always shown) ──────────────────────────────────────
+    if (!isNaN(clesPct)) {
+      var clesPctRnd = Math.round(clesPct * 100);
+      var clesCol = clesPct > 0.5 ? '#060' : clesPct < 0.5 ? '#b00' : '#555';
+      var mwp = (rawBase && rawComp) ? permutationP(rawBase, rawComp) : NaN;
+      var mwSig = !isNaN(mwp) && mwp < 0.05;
+      headerLines.push(
+        '<span style="font-size:1.4em;font-weight:bold;color:' + clesCol + '">' + clesPctRnd + '%</span>' +
+        ' <span style="color:#555">CLES</span>' +
+        (function() {
+        var dir = clesPct >= 0.5 ? 'faster' : 'slower';
+        var pct2 = clesPct >= 0.5 ? clesPctRnd : (100 - clesPctRnd);
+        var adv = mwSig ? 'significantly ' : '';
+        return ' <span style="color:#888;font-size:0.9em">new is ' + adv + dir + ' than base in ' + pct2 + '% of head-to-head run comparisons</span>';
+      })() +
+        ' <span style="color:#888">(p=' + (isNaN(mwp) ? 'n/a' : mwp < 0.001 ? '<0.001' : mwp.toFixed(3)) + ')</span>' +
+        (!mwSig ? ' <span style="color:#888">— within noise</span>' : '')
+      );
+    }
 
     if (!multimodal) {
-      // ── single-mode: one clear summary line ────────────────────────────────
+      // ── single-mode: Δ median prominently ──────────────────────────────────
       var r = pairData[0];
-      if (r) lines.push(ciLine(r.ci95, r.sig, base.peakLocs[r.bi]));
+      if (r && r.ci95) {
+        var shift = r.ci95.shift;
+        var bl = base.peakLocs[r.bi];
+        var col = r.sig ? (shift < 0 ? '#060' : '#b00') : '#555';
+        var pct = bl > 0 ? (shift / bl * 100) : 0;
+        headerLines.push(
+          'Δ median: <span style="font-size:1.15em;font-weight:bold;color:' + col + '">' +
+          (shift >= 0 ? '+' : '') + fmtVal(shift) + ' ' + unit + '</span>' +
+          (r.sig && bl > 0 ? ' <span style="color:' + col + '">(' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%)</span>' : '') +
+          ' <span style="color:#888">95% CI [' +
+          (r.ci95.lo >= 0 ? '+' : '') + fmtVal(r.ci95.lo) + ', ' +
+          (r.ci95.hi >= 0 ? '+' : '') + fmtVal(r.ci95.hi) + ']</span>' +
+          (!r.sig ? ' <span style="color:#888">— within noise</span>' : '')
+        );
+      }
     } else {
       // ── multi-mode: verdict header + per-mode rows ─────────────────────────
       var verdict;
       if (match.ub.length === 0 && match.un.length === 0 && sigCount === 0) {
-        verdict = '<span style="color:#555">No significant change across all modes</span>';
-      } else if (regressions.length === 0 && (improvements.length > 0 || match.ub.some(function(bi) { return bi === base.peakLocs.length - 1; }))) {
-        verdict = '<span style="color:#060;font-weight:bold">▼ Overall faster</span>';
-      } else if (improvements.length === 0 && (regressions.length > 0 || match.un.some(function(ci) { return ci === comp.peakLocs.length - 1; }))) {
-        verdict = '<span style="color:#b00;font-weight:bold">▲ Overall slower</span>';
+        verdict = '<span style="color:#555">No reliable change in any mode</span>';
       } else {
-        verdict = '<span style="color:#a60;font-weight:bold">⚠ Mixed</span>';
+        var newSlowPaths  = match.un.filter(function(ci) { return ci === comp.peakLocs.length - 1; }).length;
+        var lostFastPaths = match.ub.filter(function(bi) { return bi === 0 && base.peakLocs.length > 1; }).length;
+        var elimSlowPaths = match.ub.filter(function(bi) { return bi === base.peakLocs.length - 1; }).length;
+        if (regressions.length === 0 && newSlowPaths === 0 && lostFastPaths === 0 &&
+            (improvements.length > 0 || elimSlowPaths > 0)) {
+          verdict = '<span style="color:#060;font-weight:bold">▼ Overall faster</span>';
+        } else if (improvements.length === 0 && elimSlowPaths === 0 &&
+                   (regressions.length > 0 || newSlowPaths > 0 || lostFastPaths > 0)) {
+          verdict = '<span style="color:#b00;font-weight:bold">▲ Overall slower</span>';
+        } else {
+          verdict = '<span style="color:#a60;font-weight:bold">⚠ Mixed results</span>';
+        }
       }
-      lines.push(verdict +
-        '\u2002<span style="color:#888">' + base.peakLocs.length + '\u00a0modes\u00a0base\u2009·\u2009' + comp.peakLocs.length + '\u00a0comp</span>');
+      var bm = base.peakLocs.length, cm = comp.peakLocs.length;
+      var modeStr = (bm === 1 ? '1 mode' : bm + ' modes') + ' base · ' + (cm === 1 ? '1 mode' : cm + ' modes') + ' new';
+      detailLines.push(verdict + ' <span style="color:#888">' + modeStr + '</span>');
 
       pairData.forEach(function(r) {
         var letter = base.letters[r.bi];
@@ -292,47 +397,62 @@
         var df = cf - bf;
         var pl = pathLabel(letter, base.peakLocs.length);
         var fracStr = Math.abs(df) >= 0.03
-          ? Math.round(bf * 100) + '%\u00a0→\u00a0' + Math.round(cf * 100) + '%'
-          : Math.round(bf * 100) + '%\u00a0of\u00a0runs';
-        lines.push(
-          '<b style="font-size:1.05em">Mode\u00a0' + letter + '</b>' +
-          (pl ? '\u2002<span style="color:#666">' + pl + '</span>' : '') +
-          '\u2002~' + fmtVal(bl) + '\u00a0samples\u2002' + fracStr + '<br>' +
-          '\u2003' + (ciLine(r.ci95, r.sig, bl) || '<span style="color:#888">no\u00a0CI\u00a0available</span>')
+          ? Math.round(bf * 100) + '% → ' + Math.round(cf * 100) + '%'
+          : Math.round(bf * 100) + '% of runs';
+        detailLines.push(
+          '<b style="font-size:1.05em">Mode ' + letter + '</b>' +
+          (pl ? ' <span style="color:#666">' + pl + '</span>' : '') +
+          ' ~' + fmtVal(bl) + ' samples ' + fracStr + '<br>' +
+          ' ' + (ciLine(r.ci95, r.sig, bl) || '<span style="color:#888">no CI available</span>')
         );
       });
 
       match.ub.forEach(function(bi) {
         var letter = base.letters[bi], bl = base.peakLocs[bi], frac = base.fracs[bi];
-        var isSlow = letter.charCodeAt(0) - 65 === base.peakLocs.length - 1;
-        lines.push(
-          '<b>Mode\u00a0' + letter + '</b>\u2002' + pathLabel(letter, base.peakLocs.length) +
-          '\u2002~' + fmtVal(bl) + '\u00a0samples\u2002' + Math.round(frac * 100) + '%\u00a0of\u00a0base\u00a0runs<br>' +
-          '\u2003' + (isSlow
-            ? '<span style="color:#060;font-weight:bold">✓ slow path eliminated</span>'
-            : '<span style="color:#a60;font-weight:bold">⚠ fast path lost — investigate</span>')
+        var pl = pathLabel(letter, base.peakLocs.length);
+        // Find the nearest comp peak to determine where these runs likely went
+        var nearestComp = comp.peakLocs.reduce(function(a, b) {
+          return Math.abs(b - bl) < Math.abs(a - bl) ? b : a;
+        });
+        var isImprovement = bl > nearestComp;
+        var status = isImprovement
+          ? '<span style="color:#060;font-weight:bold">✓ gone — these runs are now faster (merged into a quicker path)</span>'
+          : '<span style="color:#b00;font-weight:bold">⚠ gone — these runs are now slower (merged into a slower path)</span>';
+        detailLines.push(
+          '<b>Mode ' + letter + '</b> ' + pl +
+          ' ~' + fmtVal(bl) + ' samples ' + Math.round(frac * 100) + '% of base runs<br>' +
+          ' ' + status
         );
       });
 
       match.un.forEach(function(ci) {
         var letter = comp.letters[ci], cl = comp.peakLocs[ci], frac = comp.fracs[ci];
-        var isSlow = letter.charCodeAt(0) - 65 === comp.peakLocs.length - 1;
-        lines.push(
-          '<b>Mode\u00a0' + letter + '</b>\u2002' + pathLabel(letter, comp.peakLocs.length) +
-          '\u2002~' + fmtVal(cl) + '\u00a0samples\u2002' + Math.round(frac * 100) + '%\u00a0of\u00a0new\u00a0runs<br>' +
-          '\u2003' + (isSlow
-            ? '<span style="color:#b00;font-weight:bold">⚠ new slow path appeared — investigate</span>'
-            : '<span style="color:#060;font-weight:bold">✓ new fast path</span>')
+        var pl = pathLabel(letter, comp.peakLocs.length);
+        // Find the nearest base peak to determine where these runs came from
+        var nearestBase = base.peakLocs.reduce(function(a, b) {
+          return Math.abs(b - cl) < Math.abs(a - cl) ? b : a;
+        });
+        var isImprovement = cl < nearestBase;
+        var status = isImprovement
+          ? '<span style="color:#060;font-weight:bold">✓ new path — these runs are now faster than before</span>'
+          : '<span style="color:#b00;font-weight:bold">⚠ new path — these runs are now slower than before</span>';
+        detailLines.push(
+          '<b>Mode ' + letter + '</b> ' + pl +
+          ' ~' + fmtVal(cl) + ' samples ' + Math.round(frac * 100) + '% of new runs<br>' +
+          ' ' + status
         );
       });
     }
 
-    return lines.filter(Boolean).join('<br>');
+    return {
+      header: headerLines.filter(Boolean).join('<br>'),
+      detail: detailLines.filter(Boolean).join('<br>')
+    };
   }
 
   // ── chart update ─────────────────────────────────────────────────────────────
 
-  function buildSeries(kd, vt) {
+  function buildSeries(kd, vt, chartWidth) {
     var modesArr = kd.series.map(function(s) {
       var m = fitModes(s.x, s.y, vt);
       var fracs = areaFracs(s.x, s.y, m.boundaries);
@@ -340,16 +460,31 @@
       return { peakLocs: m.peakLocs, boundaries: m.boundaries, fracs: fracs, letters: letters };
     });
 
-    // global index for vertical label stagger (all peaks sorted by x across all series)
+    // Assign vertical stagger levels: only offset labels that would overlap horizontally.
+    // Labels within 13% of the x-range of each other get different levels; others get 0.
     var allPeaks = [];
     modesArr.forEach(function(m, si) {
-      m.peakLocs.forEach(function(loc) { allPeaks.push({ loc: loc, si: si }); });
+      m.peakLocs.forEach(function(loc) { allPeaks.push({ loc: loc, si: si, level: 0 }); });
     });
     allPeaks.sort(function(a, b) { return a.loc - b.loc; });
+    var xSpan = (kd.xMax !== undefined && kd.xMin !== undefined)
+      ? kd.xMax - kd.xMin
+      : (allPeaks.length > 1 ? allPeaks[allPeaks.length - 1].loc - allPeaks[0].loc : 1);
+    var labelPx = 20 * 6;
+    var threshold = xSpan * (chartWidth > 0 ? labelPx / chartWidth : 0.13);
+    allPeaks.forEach(function(p, idx) {
+      var used = {};
+      for (var k = 0; k < idx; k++) {
+        if (Math.abs(allPeaks[k].loc - p.loc) < threshold) used[allPeaks[k].level] = true;
+      }
+      var level = 0;
+      while (used[level]) level++;
+      p.level = level;
+    });
     var globalIdx = {};
-    allPeaks.forEach(function(p, gi) {
+    allPeaks.forEach(function(p) {
       if (!globalIdx[p.si]) globalIdx[p.si] = {};
-      globalIdx[p.si][p.loc] = gi;
+      globalIdx[p.si][p.loc] = p.level;
     });
 
     var series = [];
@@ -375,7 +510,7 @@
               label: {
                 formatter: s.name.split(' ')[0] + '\u00a0' + modes.letters[pi] +
                   ':\u00a0' + fmtVal(loc) + '\u00a0(' + Math.round(modes.fracs[pi] * 100) + '%)',
-                distance: [0, gi * 18],
+                distance: [0, gi * 13],
                 color: color, fontSize: 10
               }
             }
@@ -395,21 +530,27 @@
       }
     });
 
-    var maxGi = allPeaks.length > 0 ? allPeaks.length - 1 : 0;
-    return { series: series, modesArr: modesArr, gridTop: 24 + maxGi * 20 };
+    var maxGi = allPeaks.reduce(function(m, p) { return Math.max(m, p.level); }, 0);
+    return { series: series, modesArr: modesArr, gridTop: 24 + maxGi * 14 };
   }
 
-  function recompute(kd, chart, blurbEl, vt) {
-    var result = buildSeries(kd, vt);
+  function recompute(kd, chart, headerEl, detailEl, vt) {
+    var result = buildSeries(kd, vt, chart.getWidth());
     chart.setOption({ animation: false, animationDuration: 0, animationDurationUpdate: 0,
       grid: { top: result.gridTop },
       series: result.series }, { replaceMerge: ['series'] });
-    var html = generateBlurb(kd, result.modesArr);
-    if (html) {
-      blurbEl.innerHTML = html;
-      blurbEl.classList.add('visible');
+    var blurb = generateBlurb(kd, result.modesArr);
+    if (blurb.header) {
+      headerEl.innerHTML = blurb.header;
+      headerEl.classList.add('visible');
     } else {
-      blurbEl.classList.remove('visible');
+      headerEl.classList.remove('visible');
+    }
+    if (blurb.detail) {
+      detailEl.innerHTML = blurb.detail;
+      detailEl.classList.add('visible');
+    } else {
+      detailEl.classList.remove('visible');
     }
   }
 
@@ -422,7 +563,14 @@
     var kd; try { kd = JSON.parse(raw); } catch(e) { return; }
     initialized.add(el);
 
-    // inject controls above and blurb below
+    // headerEl/detailEl go outside any <details> wrapper; controls stay inside
+    var wrapper = el.closest('details') || el.parentNode;
+    var outerParent = wrapper.parentNode;
+
+    var headerEl = document.createElement('div');
+    headerEl.className = 'kde-blurb';
+    outerParent.insertBefore(headerEl, wrapper);
+
     var controls = document.createElement('div');
     controls.className = 'kde-controls';
     var vt = 0.5;
@@ -435,11 +583,11 @@
     var valLabel = controls.querySelector('span');
     el.parentNode.insertBefore(controls, el);
 
-    var blurbEl = document.createElement('div');
-    blurbEl.className = 'kde-blurb';
-    el.parentNode.insertBefore(blurbEl, el.nextSibling);
+    var detailEl = document.createElement('div');
+    detailEl.className = 'kde-blurb';
+    outerParent.insertBefore(detailEl, wrapper.nextSibling);
 
-    var initialGridTop = buildSeries(kd, vt).gridTop;
+    var initialGridTop = buildSeries(kd, vt, el.clientWidth).gridTop;
     var chart = echarts.init(el, 'instant');
     chart.setOption({
       animation: false,
@@ -470,19 +618,19 @@
           type: 'value',
           min: kd.xMin !== undefined ? Math.max(0, kd.xMin - margin) : 0,
           max: kd.xMax !== undefined ? kd.xMax + margin : undefined,
-          name: 'samples/iter', nameLocation: 'middle', nameGap: 24,
+          name: kd.unit || 'samples/iter', nameLocation: 'middle', nameGap: 24,
           nameTextStyle: { fontSize: 10 }, axisLabel: { fontSize: 10 }
         };
       })(),
       yAxis: { type: 'value', show: false }
     });
 
-    recompute(kd, chart, blurbEl, vt);
+    recompute(kd, chart, headerEl, detailEl, vt);
 
     slider.addEventListener('input', function() {
       vt = parseInt(this.value) / 100;
       valLabel.textContent = this.value + '%';
-      recompute(kd, chart, blurbEl, vt);
+      recompute(kd, chart, headerEl, detailEl, vt);
     });
 
     new ResizeObserver(function() { chart.resize(); }).observe(el);

@@ -24,4 +24,4 @@ dependencies = [
 perfcompare = "perf_compare_cli_new:main"
 
 [tool.setuptools]
-py-modules = ["perf_compare_cli_new"]
+py-modules = ["perf_compare_cli_new", "perf_compare_display", "perf_compare_stats"]

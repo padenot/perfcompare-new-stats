@@ -12,6 +12,12 @@ uv sync
 uv run perfcompare <perf.compare URL> [options]
 ```
 
+The code is split by responsibility:
+
+- `perf_compare_stats.py`: reusable analysis layer with pure statistical functions and typed result objects.
+- `perf_compare_display.py`: HTML/text rendering for those result objects.
+- `perf_compare_cli_new.py`: CLI, fetching, caching, and multiprocessing orchestration.
+
 Options:
 
 | Flag | Description |
